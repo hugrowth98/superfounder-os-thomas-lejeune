@@ -1,0 +1,1609 @@
+"""Bibliotheque commune des skills d'execution du module GTM.
+
+Tous les scripts de 10_Skills/*/scripts/ l'importent. Elle sait :
+  - retrouver la racine du module GTM (le dossier qui contient OUTILS.md) et lire son .env
+  - lire les choix de OUTILS.md (priorite, canal_linkedin, canal_email, crm)
+  - lire et ecrire des CSV UTF-8 aux colonnes normalisees (CONVENTIONS.md section 8)
+  - parler aux APIs de la stack avec `requests` uniquement : Unipile, FullEnrich, Crustdata, HubSpot
+
+Python 3.9+ (ecrit pour 3.10, sans syntaxe exclusive). Aucune cle en dur : tout vient du .env.
+
+Amorce a copier en tete de chaque script :
+
+    import sys
+    from pathlib import Path
+    _racine = next((d for d in Path(__file__).resolve().parents if (d / "CLAUDE.md").exists() and (d / "10_Skills").is_dir()), None)
+    if _racine is None:
+        sys.exit("Racine du workspace introuvable (CLAUDE.md + 10_Skills/) : ce script doit vivre dans 10_Skills/ de Superfounder OS.")
+    sys.path.insert(0, str(_racine / "10_Skills" / "_commun"))
+    from gtm_common import *
+"""
+from __future__ import annotations
+
+import csv
+import json
+import os
+import re
+import sys
+import time
+import unicodedata
+import warnings
+from datetime import date, datetime
+from pathlib import Path
+
+warnings.filterwarnings("ignore", message="urllib3 v2 only supports OpenSSL")
+try:
+    import requests
+except ImportError:  # pragma: no cover
+    sys.exit("Le module 'requests' manque : pip3 install requests")
+
+__all__ = [
+    "COLONNES", "PredictLeads", "TheirStack", "Lemlist", "Ocean", "racine", "dossier_gtm", "load_env", "env", "lire_outils", "dossier_listes", "chemin_sortie",
+    "slug", "norm_texte", "norm_linkedin_url", "slug_linkedin", "domaine", "aujourd_hui",
+    "seniorite_depuis_titre", "sujet_depuis_fichier", "fraicheur", "lire_csv", "ecrire_csv", "http", "afficher", "bandeau_dry_run", "estimer",
+    "Unipile", "FullEnrich", "Crustdata", "HubSpot", "extraire_post_id", "arret",
+]
+
+# Colonnes normalisees, dans cet ordre (CONVENTIONS.md section 8)
+COLONNES = [
+    "prenom", "nom", "titre", "seniorite", "entreprise", "domaine", "linkedin_url",
+    "linkedin_entreprise_url", "email", "email_statut", "telephone", "ville", "pays", "secteur",
+    "effectif", "source", "date_extraction", "score_icp", "tier", "signal_type", "signal_date",
+    "signal_detail", "score_signal", "fraicheur", "exclu", "raison_exclusion", "ne_plus_contacter",
+]
+
+_RACINE: Path | None = None
+_ENV_CHARGE = False
+
+
+# ---------------------------------------------------------------- racine, .env, OUTILS.md
+
+def racine(depuis: str | Path | None = None) -> Path:
+    """La racine du workspace Superfounder OS : on remonte depuis ce fichier (ou `depuis`) jusqu'au
+    dossier qui contient CLAUDE.md et 10_Skills/. Les reglages du module GTM sont dans
+    05_Departements/Go-to-Market/ (OUTILS.md, contexte.md, GARDE-FOUS.md), le .env a la racine."""
+    global _RACINE
+    if _RACINE is not None and depuis is None:
+        return _RACINE
+    start = Path(depuis).resolve() if depuis else Path(__file__).resolve()
+    for d in [start] + list(start.parents):
+        if (d / "CLAUDE.md").exists() and (d / "10_Skills").is_dir():
+            if depuis is None:
+                _RACINE = d
+            return d
+    arret("Racine introuvable : ce script doit vivre dans 10_Skills/ d'un workspace Superfounder OS (CLAUDE.md a la racine).")
+
+
+def dossier_gtm() -> Path:
+    """05_Departements/Go-to-Market/ : les reglages et les sorties du module GTM."""
+    d = racine() / "05_Departements" / "Go-to-Market"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def load_env() -> dict:
+    """Charge <racine>/.env dans os.environ (sans ecraser une variable deja definie)."""
+    global _ENV_CHARGE
+    fichier = racine() / ".env"
+    valeurs = {}
+    if fichier.exists():
+        for ligne in fichier.read_text(encoding="utf-8").splitlines():
+            ligne = ligne.strip()
+            if not ligne or ligne.startswith("#") or "=" not in ligne:
+                continue
+            k, v = ligne.split("=", 1)
+            k = k.strip().replace("export ", "")
+            v = v.strip().strip('"').strip("'")
+            valeurs[k] = v
+            os.environ.setdefault(k, v)
+    _ENV_CHARGE = True
+    return valeurs
+
+
+def env(nom: str, obligatoire: bool = True, aide: str = "") -> str:
+    """Valeur d'une variable du .env. Si elle manque et qu'elle est obligatoire : arret propre
+    avec le renvoi vers `connecter-outils`."""
+    if not _ENV_CHARGE:
+        load_env()
+    val = os.environ.get(nom, "").strip()
+    if not val and obligatoire:
+        arret(f"{nom} absent du .env a la racine du workspace ({racine() / '.env'}). "
+              f"Lancez `connecter-outils` pour brancher l'outil. {aide}".strip())
+    return val
+
+
+def cookies_linkedin() -> tuple[list[dict], str]:
+    """Cookies + user agent pour les actors Apify Sales Navigator. Ordre :
+    1. rafraichissement automatique depuis le navigateur (connecter-outils/scripts/rafraichir_cookies_linkedin.py)
+       si browser_cookie3 est installe : cookies du jour et user agent aligne sur la version reelle de Chrome
+       (un user agent perime fait renouveler la session par LinkedIn : page 1 passe, page 2 "Cookies are expired")
+    2. LINKEDIN_COOKIES_FILE (export complet, avec son userAgent s'il en a un)
+    3. LINKEDIN_LI_AT + LINKEDIN_LI_A + LINKEDIN_USER_AGENT du .env (jeu minimal, souvent refuse par l'actor)."""
+    import subprocess
+    script = racine() / "10_Skills" / "connecter-outils" / "scripts" / "rafraichir_cookies_linkedin.py"
+    fichier = env("LINKEDIN_COOKIES_FILE", obligatoire=False) or str(racine() / ".linkedin-cookies.json")
+    if script.exists() and env("LINKEDIN_COOKIES_AUTO", obligatoire=False).lower() not in ("0", "non", "false"):
+        r = subprocess.run([sys.executable, str(script), "--silencieux"], capture_output=True, text=True)
+        if r.returncode == 0:
+            print(r.stdout.strip() or "cookies LinkedIn rafraichis", file=sys.stderr)
+        else:
+            print(f"rafraichissement des cookies impossible ({(r.stdout + r.stderr).strip().splitlines()[-1:] or ['?']}), "
+                  f"je prends ceux du .env", file=sys.stderr)
+    if Path(fichier).exists():
+        data = json.loads(Path(fichier).read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            return data, env("LINKEDIN_USER_AGENT", aide="Ecrivez LINKEDIN_USER_AGENT dans .env (connecter-outils, etape 9).")
+        ua = data.get("userAgent") or env("LINKEDIN_USER_AGENT", aide="Ecrivez LINKEDIN_USER_AGENT dans .env (connecter-outils, etape 9).")
+        return data.get("cookie", []), ua
+    ua = env("LINKEDIN_USER_AGENT", aide="Ecrivez LINKEDIN_USER_AGENT dans .env (connecter-outils, etape 9).")
+    li_at = env("LINKEDIN_LI_AT", aide="Ecrivez LINKEDIN_LI_AT (et LINKEDIN_LI_A pour Sales Navigator) dans .env, ou installez browser_cookie3.")
+    cookies = [{"name": "li_at", "value": li_at, "domain": ".linkedin.com", "path": "/", "secure": True, "httpOnly": True}]
+    li_a = env("LINKEDIN_LI_A", obligatoire=False)
+    if li_a:
+        cookies.append({"name": "li_a", "value": li_a, "domain": ".linkedin.com", "path": "/", "secure": True, "httpOnly": True})
+    return cookies, ua
+
+
+def cookies_linkedin_disponibles() -> bool:
+    """Vrai si un run Apify Sales Navigator a de quoi s'authentifier (fichier, .env, ou navigateur lisible)."""
+    fichier = env("LINKEDIN_COOKIES_FILE", obligatoire=False) or str(racine() / ".linkedin-cookies.json")
+    if Path(fichier).exists() or (env("LINKEDIN_USER_AGENT", obligatoire=False) and env("LINKEDIN_LI_AT", obligatoire=False)):
+        return True
+    try:
+        import browser_cookie3  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def lire_outils() -> dict:
+    """Les quatre choix ecrits par connecter-outils dans OUTILS.md."""
+    fichier = dossier_gtm() / "OUTILS.md"
+    if not fichier.exists():
+        arret(f"OUTILS.md introuvable ({fichier}). Lancez `connecter-outils`.")
+    texte = fichier.read_text(encoding="utf-8")
+    choix = {"priorite": "", "canal_linkedin": "", "canal_email": "", "crm": ""}
+    for cle in choix:
+        m = re.search(rf"^{cle}:\s*([a-zA-Z_-]+)", texte, re.M)
+        if m and not m.group(1).startswith("["):
+            choix[cle] = m.group(1).lower()
+    return choix
+
+
+def dossier_listes() -> Path:
+    d = racine() / "05_Departements" / "Go-to-Market" / "Listes-prospection"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def chemin_sortie(verbe: str, sujet: str, suffixe: str = "", ext: str = ".csv") -> Path:
+    """<verbe>_<sujet>_<YYYY-MM-DD>[_suffixe].csv dans Listes-prospection/."""
+    nom = f"{verbe}_{slug(sujet) or 'run'}_{aujourd_hui()}"
+    if suffixe:
+        nom += f"_{slug(suffixe)}"
+    return dossier_listes() / f"{nom}{ext}"
+
+
+def sujet_depuis_fichier(chemin: str | Path, sujet: str = "") -> str:
+    """Le <sujet> d'un fichier <verbe>_<sujet>_<date>.csv, ou le nom du fichier sinon."""
+    if sujet:
+        return sujet
+    stem = Path(chemin).stem
+    parts = stem.split("_")
+    if len(parts) >= 3 and re.match(r"\d{4}-\d{2}-\d{2}", parts[-1]):
+        return "_".join(parts[1:-1])
+    if len(parts) >= 3 and re.match(r"\d{4}-\d{2}-\d{2}", parts[2]):
+        return parts[1]
+    return stem
+
+
+# ---------------------------------------------------------------- texte, urls, dates
+
+def norm_texte(s) -> str:
+    """minuscule, sans accents, ponctuation remplacee par des espaces."""
+    if s is None:
+        return ""
+    s = unicodedata.normalize("NFKD", str(s)).encode("ascii", "ignore").decode("ascii").lower()
+    return re.sub(r"[^a-z0-9]+", " ", s).strip()
+
+
+def slug(s) -> str:
+    return re.sub(r"\s+", "-", norm_texte(s))[:60].strip("-")
+
+
+def norm_linkedin_url(u) -> str:
+    """https://www.linkedin.com/in/<slug> en minuscules, sans parametres ni slash final.
+    Fonctionne aussi pour /company/ et /school/. Vide si ce n'est pas une URL LinkedIn."""
+    if not u:
+        return ""
+    u = str(u).strip()
+    m = re.search(r"linkedin\.com/(in|company|school|sales/lead|sales/company)/([^/?#]+)", u, re.I)
+    if not m:
+        return ""
+    genre, ident = m.group(1).lower(), m.group(2)
+    if genre == "sales/lead":
+        genre = "in"
+    if genre == "sales/company":
+        genre = "company"
+    ident = ident.split(",")[0]
+    return f"https://www.linkedin.com/{genre}/{ident.lower()}"
+
+
+def slug_linkedin(u) -> str:
+    n = norm_linkedin_url(u)
+    return n.rsplit("/", 1)[-1] if n else ""
+
+
+def domaine(u) -> str:
+    """'https://www.acme.fr/contact?x=1' -> 'acme.fr'. Accepte un email : renvoie son domaine."""
+    if not u:
+        return ""
+    u = str(u).strip().lower()
+    if "@" in u and " " not in u:
+        return u.split("@", 1)[1]
+    u = re.sub(r"^[a-z]+://", "", u)
+    u = re.sub(r"^www\.", "", u)
+    return u.split("/")[0].split("?")[0].split(":")[0]
+
+
+def aujourd_hui() -> str:
+    return date.today().isoformat()
+
+
+def fraicheur(signal_date) -> str:
+    """Nombre entier de jours ecoules depuis signal_date (YYYY-MM-DD ou ISO). Vide si pas de date."""
+    s = str(signal_date or "")[:10]
+    try:
+        d = datetime.strptime(s, "%Y-%m-%d").date()
+    except ValueError:
+        return ""
+    return str(max(0, (date.today() - d).days))
+
+
+_SENIORITES = [
+    ("fondateur", r"\b(fondateur|fondatrice|founder|co ?founder|cofondat|owner|proprietaire|gerant|gerante|ceo|pdg|president|presidente|dirigeant|dirigeante|managing director|directeur general|directrice generale|chief executive)\b"),
+    ("c_level", r"\b(c[a-z]o|chief [a-z]+ officer|directeur associe|directrice associee|managing partner|associe)\b"),
+    ("vp", r"\b(vp|vice president|vice presidente|svp|evp)\b"),
+    ("directeur", r"\b(directeur|directrice|director|dsi|drh|daf)\b"),
+    ("head", r"\b(head of|head|responsable|lead)\b"),
+    ("manager", r"\b(manager|chef de|charge de|chargee de)\b"),
+    ("senior", r"\b(senior|expert|specialiste|specialist|consultant|consultante)\b"),
+]
+
+
+def seniorite_depuis_titre(titre) -> str:
+    """Seniorite normalisee (fondateur, c_level, vp, directeur, head, manager, senior, autre)
+    depuis un intitule de poste ou un headline. Regle simple, affinee par qualifier-liste."""
+    t = " " + norm_texte(titre) + " "
+    if not t.strip():
+        return ""
+    for nom, motif in _SENIORITES:
+        if re.search(motif, t):
+            return nom
+    return "autre"
+
+
+def extraire_post_id(url: str) -> str:
+    """Id numerique d'un post LinkedIn depuis son URL (ou l'URN tel quel)."""
+    if url.startswith("urn:li:"):
+        return url
+    m = re.search(r"(?:activity|share|ugcPost)[/:-](\d+)", url)
+    if not m:
+        raise ValueError(f"Impossible d'extraire l'id du post depuis : {url}")
+    return m.group(1)
+
+
+# ---------------------------------------------------------------- CSV
+
+def lire_csv(chemin: str | Path) -> list[dict]:
+    """Lit un CSV UTF-8 (avec ou sans BOM), separateur virgule ou point-virgule detecte."""
+    p = Path(chemin)
+    if not p.exists():
+        arret(f"Fichier introuvable : {p}")
+    with open(p, encoding="utf-8-sig", newline="") as fh:
+        debut = fh.read(4096)
+        fh.seek(0)
+        sep = ";" if debut.count(";") > debut.count(",") else ","
+        return [dict(r) for r in csv.DictReader(fh, delimiter=sep)]
+
+
+def ecrire_csv(lignes: list[dict], chemin: str | Path, colonnes_extra: list[str] | None = None) -> Path:
+    """Ecrit un CSV UTF-8 : d'abord les colonnes normalisees presentes, dans l'ordre du contrat,
+    puis les colonnes supplementaires dans l'ordre de premiere apparition."""
+    p = Path(chemin)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    presentes = set()
+    ordre_extra: list[str] = []
+    for l in lignes:
+        for k in l:
+            presentes.add(k)
+            if k not in COLONNES and k not in ordre_extra:
+                ordre_extra.append(k)
+    for k in colonnes_extra or []:
+        if k not in ordre_extra and k not in COLONNES:
+            ordre_extra.append(k)
+    cols = [c for c in COLONNES if c in presentes] + ordre_extra
+    with open(p, "w", encoding="utf-8", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=cols, extrasaction="ignore")
+        w.writeheader()
+        for l in lignes:
+            w.writerow({c: _plat(l.get(c)) for c in cols})
+    return p
+
+
+def _plat(v):
+    if v is None:
+        return ""
+    if isinstance(v, bool):
+        return "oui" if v else "non"
+    if isinstance(v, (list, tuple)):
+        return " | ".join(_plat(x) for x in v if x not in (None, ""))
+    if isinstance(v, dict):
+        return json.dumps(v, ensure_ascii=False)
+    return str(v).replace("\r", " ").replace("\n", " ").strip()
+
+
+# ---------------------------------------------------------------- HTTP et affichage
+
+def http(methode: str, url: str, headers: dict | None = None, params: dict | None = None,
+         json_body=None, timeout: int = 60, essais: int = 3, auth=None):
+    """Appel HTTP avec reprise sur 429 et 5xx. Renvoie (statut, corps decode ou texte)."""
+    derniere = None
+    for tentative in range(essais):
+        try:
+            r = requests.request(methode, url, headers=headers, params=params, json=json_body,
+                                 timeout=timeout, auth=auth)
+        except requests.RequestException as e:
+            derniere = f"reseau : {e}"
+            time.sleep(2 * (tentative + 1))
+            continue
+        if r.status_code == 429 or r.status_code >= 500:
+            derniere = f"HTTP {r.status_code} : {r.text[:300]}"
+            time.sleep(3 * (tentative + 1))
+            continue
+        try:
+            corps = r.json() if r.text else {}
+        except ValueError:
+            corps = r.text
+        return r.status_code, corps
+    raise RuntimeError(f"{methode} {url} a echoue apres {essais} essais ({derniere})")
+
+
+def afficher(msg: str) -> None:
+    print(msg, flush=True)
+
+
+def arret(msg: str) -> None:
+    print(f"[stop] {msg}", file=sys.stderr, flush=True)
+    sys.exit(1)
+
+
+def bandeau_dry_run(titre: str, lignes: list[str]) -> None:
+    afficher(f"[dry-run] {titre}")
+    for l in lignes:
+        afficher(f"          {l}")
+    afficher("[dry-run] Aucun appel API effectue. Relancez sans --dry-run pour executer.")
+
+
+def estimer(n: int, prix_unitaire: float, depart: float = 0.0, unite: str = "resultat") -> str:
+    total = n * prix_unitaire + depart
+    return f"{n} {unite}(s) x {prix_unitaire:.4f} $ + {depart:.3f} $ de depart = environ {total:.2f} $"
+
+
+# ---------------------------------------------------------------- Unipile
+
+# ---------------------------------------------------------------- registre des requetes (Ciblage/requetes-booleennes.md)
+
+REQUETES_ENTETE = ("# Requêtes Sales Navigator, LinkedIn et Ocean.io\n\n"
+                   "> Écrit par `construire-requete-salesnav --enregistrer`, `trouver-personnes` et `trouver-entreprises` "
+                   "(colonne Volume remplie après chaque run). Une ligne par requête ; rejouer la commande ou l'URL telle quelle.\n\n"
+                   "| Date | Nom | Persona | Filtres | URL ou commande | Volume | Notes |\n|---|---|---|---|---|---|---|\n")
+
+
+def chemin_requetes() -> Path:
+    return dossier_gtm() / "Ciblage" / "requetes-booleennes.md"
+
+
+def _cellule(s) -> str:
+    return str(s or "").replace("|", "/").replace("\n", " ").strip()
+
+
+def enregistrer_requete(nom: str, persona: str, filtres: str, reference: str, volume="", notes="") -> Path:
+    """Ajoute une ligne au registre (ou remplit la colonne Volume si la reference, URL ou commande, y est deja)."""
+    chemin = chemin_requetes()
+    chemin.parent.mkdir(parents=True, exist_ok=True)
+    if not chemin.exists():
+        chemin.write_text(REQUETES_ENTETE, encoding="utf-8")
+    if reference and maj_volume_requete(reference, volume, notes):
+        return chemin
+    with chemin.open("a", encoding="utf-8") as f:
+        f.write(f"| {aujourd_hui()} | {_cellule(nom)} | {_cellule(persona)} | {_cellule(filtres)} | {_cellule(reference)} | {_cellule(volume)} | {_cellule(notes)} |\n")
+    return chemin
+
+
+def maj_volume_requete(reference: str, volume, notes="") -> bool:
+    """Remplit Volume (et Notes) sur la ligne du registre dont la colonne URL ou commande vaut `reference`. Vrai si trouvee."""
+    chemin = chemin_requetes()
+    if not chemin.exists() or not reference:
+        return False
+    lignes = chemin.read_text(encoding="utf-8").splitlines()
+    ref = _cellule(reference)
+    for i, l in enumerate(lignes):
+        cells = [c.strip() for c in l.strip().strip("|").split("|")] if l.startswith("|") else []
+        if len(cells) >= 7 and cells[4] == ref and not cells[0].startswith("-"):
+            cells[5] = f"{volume} ({aujourd_hui()})" if volume != "" else cells[5]
+            if notes:
+                cells[6] = _cellule(notes)
+            lignes[i] = "| " + " | ".join(cells) + " |"
+            chemin.write_text("\n".join(lignes) + "\n", encoding="utf-8")
+            return True
+    return False
+
+
+class Unipile:
+    """Client REST Unipile (compte LinkedIn de l'utilisateur). Cles : UNIPILE_API_KEY, UNIPILE_DSN,
+    UNIPILE_ACCOUNT_ID (et UNIPILE_OWN_PROVIDER_ID pour distinguer nos messages des reponses)."""
+
+    def __init__(self, exiger_compte: bool = True):
+        self.dernier_total = None
+        self.dsn = env("UNIPILE_DSN").rstrip("/")
+        self.cle = env("UNIPILE_API_KEY")
+        self.account_id = env("UNIPILE_ACCOUNT_ID", obligatoire=exiger_compte)
+        self.own_provider_id = env("UNIPILE_OWN_PROVIDER_ID", obligatoire=False)
+
+    def _h(self, json_: bool = False) -> dict:
+        h = {"X-API-KEY": self.cle, "Accept": "application/json"}
+        if json_:
+            h["Content-Type"] = "application/json"
+        return h
+
+    def get(self, chemin: str, params: dict | None = None):
+        params = {k: v for k, v in (params or {}).items() if v is not None}
+        st, corps = http("GET", f"{self.dsn}{chemin}", headers=self._h(), params=params)
+        if st >= 400:
+            raise RuntimeError(f"Unipile GET {chemin} -> HTTP {st} : {str(corps)[:300]}")
+        return corps
+
+    def post(self, chemin: str, body: dict, params: dict | None = None):
+        st, corps = http("POST", f"{self.dsn}{chemin}", headers=self._h(True), params=params, json_body=body)
+        if st >= 400:
+            raise RuntimeError(f"Unipile POST {chemin} -> HTTP {st} : {str(corps)[:300]}")
+        return corps
+
+    # comptes
+    def comptes(self) -> list[dict]:
+        data = self.get("/api/v1/accounts")
+        return data.get("items", data if isinstance(data, list) else [])
+
+    # ids des filtres de recherche (regions, secteurs, entreprises, listes) : gratuit
+    def parametres(self, type_: str, mots: str | None = None, service: str = "SALES_NAVIGATOR", limite: int = 10) -> list[dict]:
+        """GET /api/v1/linkedin/search/parameters : les ids que LinkedIn attend dans une recherche.
+        type_ : LOCATION, COMPANY, SCHOOL, INDUSTRY, JOB_FUNCTION, JOB_TITLE, SKILL (classique) ;
+        REGION, POSTAL_CODE, SALES_INDUSTRY, ACCOUNT_LISTS, LEAD_LISTS, TECHNOLOGIES, PERSONA (Sales Navigator).
+        Chaque item rend `id` et `title`."""
+        data = self.get("/api/v1/linkedin/search/parameters",
+                        params={"account_id": self.account_id, "type": type_, "keywords": mots, "service": service, "limit": limite})
+        return data.get("items", data if isinstance(data, list) else [])
+
+    # recherche LinkedIn / Sales Navigator (meme endpoint, seul `api` change)
+    def recherche(self, api: str = "sales_navigator", categorie: str = "people", url: str | None = None,
+                  mots_cles: str | None = None, max_resultats: int = 100) -> list[dict]:
+        items, cursor, iterations = [], None, 0
+        page = 50 if api == "classic" else 100
+        while len(items) < max_resultats and iterations < max_resultats + 50:
+            iterations += 1
+            body = {"api": api, "category": categorie, "limit": min(page, max_resultats - len(items))}
+            if url:
+                body["url"] = url
+            if mots_cles:
+                body["keywords"] = mots_cles
+            if cursor:
+                body["cursor"] = cursor
+            data = self.post("/api/v1/linkedin/search", body, params={"account_id": self.account_id})
+            lot = data.get("items", [])
+            items.extend(lot)
+            tot = (data.get("paging") or {}).get("total_count")
+            if tot is not None:
+                self.dernier_total = tot
+            cursor = data.get("cursor") or (data.get("paging") or {}).get("cursor")
+            if not cursor or not lot:
+                break
+        return items[:max_resultats]
+
+    def profil(self, identifiant: str, complet: bool = True) -> dict:
+        params = {"account_id": self.account_id}
+        if complet:
+            params["linkedin_sections"] = "*"
+        return self.get(f"/api/v1/users/{identifiant}", params)
+
+    def posts(self, identifiant: str, entreprise: bool = False, limite: int = 5) -> list[str]:
+        """Les derniers posts d'une personne (provider_id ou slug) ou d'une page entreprise, en texte court avec la date."""
+        chemin = f"/api/v1/linkedin/company/{identifiant}/posts" if entreprise else f"/api/v1/users/{identifiant}/posts"
+        try:
+            rep = self.get(chemin, {"account_id": self.account_id, "limit": limite})
+        except RuntimeError as e:
+            if "404" in str(e):
+                return []
+            raise
+        items = rep.get("items", rep) if isinstance(rep, dict) else rep
+        out = []
+        for it in (items or [])[:limite]:
+            if not isinstance(it, dict):
+                continue
+            texte = (it.get("text") or it.get("commentary") or "").replace("\n", " ").strip()
+            date = str(it.get("date") or it.get("created_at") or it.get("parsed_datetime") or "")[:10]
+            if texte:
+                out.append(f"[{date}] {texte[:220]}")
+        return out
+
+    def entreprise(self, identifiant: str) -> dict:
+        try:
+            return self.get(f"/api/v1/linkedin/company/{identifiant}", {"account_id": self.account_id})
+        except RuntimeError as e:
+            if "404" not in str(e):
+                raise
+            items = self.recherche(api="classic", categorie="companies", mots_cles=identifiant, max_resultats=5)
+            if not items:
+                raise RuntimeError(f"Entreprise introuvable, meme via recherche : {identifiant}") from e
+            top = items[0]
+            ident = slug_linkedin(top.get("profile_url") or top.get("linkedin_url") or "") or str(top.get("id"))
+            return self.get(f"/api/v1/linkedin/company/{ident}", {"account_id": self.account_id})
+
+    def _pages(self, chemin: str, max_pages: int, params_extra: dict | None = None) -> list[dict]:
+        items, cursor, pages = [], None, 0
+        while pages < max_pages:
+            pages += 1
+            params = {"account_id": self.account_id, "limit": 100}
+            params.update(params_extra or {})
+            if cursor:
+                params["cursor"] = cursor
+            data = self.get(chemin, params)
+            lot = data.get("items", [])
+            items.extend(lot)
+            tot = (data.get("paging") or {}).get("total_count")
+            if tot is not None:
+                self.dernier_total = tot
+            cursor = data.get("cursor") or (data.get("paging") or {}).get("cursor")
+            if not cursor or not lot:
+                break
+        return items
+
+    def reactions(self, post_id: str, max_pages: int = 10) -> list[dict]:
+        return self._pages(f"/api/v1/posts/{post_id}/reactions", max_pages)
+
+    def commentaires(self, post_id: str, max_pages: int = 10) -> list[dict]:
+        return self._pages(f"/api/v1/posts/{post_id}/comments", max_pages)
+
+    def chats(self, limite: int = 100) -> list[dict]:
+        data = self.get("/api/v1/chats", {"account_id": self.account_id, "limit": limite})
+        return data.get("items", data if isinstance(data, list) else [])
+
+    def messages(self, chat_id: str, limite: int = 50) -> list[dict]:
+        data = self.get(f"/api/v1/chats/{chat_id}/messages", {"limit": limite})
+        return data.get("items", data if isinstance(data, list) else [])
+
+    def participants(self, chat_id: str) -> list[dict]:
+        data = self.get(f"/api/v1/chats/{chat_id}/attendees")
+        return data.get("items", data if isinstance(data, list) else [])
+
+    def inviter(self, provider_id: str, message: str | None = None) -> dict:
+        body = {"account_id": self.account_id, "provider_id": provider_id}
+        if message:
+            body["message"] = message
+        return self.post("/api/v1/users/invite", body)
+
+    def envoyer_dm(self, provider_id: str, texte: str) -> dict:
+        return self.post("/api/v1/chats", {"account_id": self.account_id, "attendees_ids": [provider_id], "text": texte})
+
+    def repondants(self) -> list[dict]:
+        """Conversations ou le dernier message ne vient pas de nous (donc le prospect a repondu)."""
+        resultat = []
+        for chat in self.chats():
+            chat_id = chat.get("id")
+            if not chat_id:
+                continue
+            msgs = self.messages(chat_id)
+            if not msgs:
+                continue
+            dernier = msgs[-1] if msgs[-1].get("timestamp", "") >= msgs[0].get("timestamp", "") else msgs[0]
+            de_nous = dernier.get("is_sender")
+            if de_nous is None:
+                exp = dernier.get("sender_id") or (dernier.get("sender") or {}).get("id")
+                de_nous = bool(self.own_provider_id) and exp == self.own_provider_id
+            if de_nous in (1, True):
+                continue
+            resultat.append({
+                "chat_id": chat_id,
+                "provider_id": chat.get("attendee_provider_id") or dernier.get("sender_id"),
+                "nom_chat": chat.get("name"),
+                "dernier_message": dernier.get("text"),
+                "date_reponse": (dernier.get("timestamp") or "")[:10],
+            })
+        return resultat
+
+
+# ---------------------------------------------------------------- FullEnrich
+
+class FullEnrich:
+    """Client FullEnrich v2. Cle : FULLENRICH_API_KEY. 1 credit par email pro trouve, 10 par mobile,
+    facture seulement sur resultat trouve, gratuit si deja enrichi il y a moins de 3 mois."""
+    BASE = "https://app.fullenrich.com/api/v2"
+
+    def __init__(self, exiger_cle: bool = True):
+        self.cle = env("FULLENRICH_API_KEY", obligatoire=exiger_cle)
+
+    def _h(self) -> dict:
+        if not self.cle:
+            env("FULLENRICH_API_KEY")
+        return {"Authorization": f"Bearer {self.cle}", "Content-Type": "application/json"}
+
+    def _req(self, methode: str, chemin: str, body=None):
+        st, corps = http(methode, f"{self.BASE}{chemin}", headers=self._h(), json_body=body)
+        if st == 402:
+            raise RuntimeError("FullEnrich : credits insuffisants (HTTP 402)")
+        if st >= 400:
+            raise RuntimeError(f"FullEnrich {methode} {chemin} -> HTTP {st} : {str(corps)[:300]}")
+        return corps
+
+    def credits(self) -> int:
+        return int(self._req("GET", "/account/credits").get("balance", 0))
+
+    def lancer(self, contacts: list[dict], nom: str = "module GTM") -> str:
+        """contacts : dicts {first_name, last_name, company_name|domain|linkedin_url, enrich_fields, custom}."""
+        return self._req("POST", "/contact/enrich/bulk", {"name": nom, "data": contacts})["enrichment_id"]
+
+    def attendre(self, enrichment_id: str, timeout_s: int = 600, intervalle_s: int = 15) -> dict:
+        fin = time.time() + timeout_s
+        time.sleep(20)
+        while time.time() < fin:
+            res = self._req("GET", f"/contact/enrich/bulk/{enrichment_id}")
+            statut = res.get("status")
+            if statut == "FINISHED":
+                return res
+            if statut in ("CANCELED", "CREDITS_INSUFFICIENT", "RATE_LIMIT", "UNKNOWN"):
+                raise RuntimeError(f"FullEnrich : enrichissement {enrichment_id} termine en {statut}")
+            time.sleep(intervalle_s)
+        raise TimeoutError(f"FullEnrich : {enrichment_id} pas fini apres {timeout_s}s")
+
+    @staticmethod
+    def contact_depuis_ligne(ligne: dict, champs: list[str]) -> dict | None:
+        """Construit l'entree FullEnrich depuis une ligne normalisee. None si la ligne ne permet
+        aucun match (il faut prenom + nom + entreprise ou domaine, ou une URL LinkedIn)."""
+        c = {"enrich_fields": champs}
+        if ligne.get("prenom"):
+            c["first_name"] = ligne["prenom"].strip()
+        if ligne.get("nom"):
+            c["last_name"] = ligne["nom"].strip()
+        if ligne.get("domaine"):
+            c["domain"] = domaine(ligne["domaine"])
+        if ligne.get("entreprise"):
+            c["company_name"] = ligne["entreprise"].strip()
+        if ligne.get("linkedin_url"):
+            c["linkedin_url"] = norm_linkedin_url(ligne["linkedin_url"]) or ligne["linkedin_url"].strip()
+        ok_nom = bool(c.get("first_name") and c.get("last_name") and (c.get("domain") or c.get("company_name")))
+        if not ok_nom and not c.get("linkedin_url"):
+            return None
+        return c
+
+    @staticmethod
+    def aplatir(item: dict) -> dict:
+        ci = item.get("contact_info") or {}
+        we = ci.get("most_probable_work_email") or {}
+        ph = ci.get("most_probable_phone") or {}
+        prof = item.get("profile") or {}
+        emp = (prof.get("employment") or {}).get("current") or {}
+        return {
+            "email": we.get("email") or "",
+            "email_statut": we.get("status") or "",
+            "telephone": ph.get("number") or "",
+            "titre_fullenrich": emp.get("title") or "",
+            "seniorite_fullenrich": emp.get("seniority") or "",
+            "custom_id": (item.get("custom") or {}).get("user_id") or "",
+        }
+
+    STATUTS_INVALIDES = {"INVALID", "INVALID_DOMAIN", "INVALIDE", "BOUNCE", "BOUNCED", "UNKNOWN_INVALID"}
+
+    @classmethod
+    def a_enrichir(cls, ligne: dict, champs: list[str], forcer: bool = False) -> bool:
+        """Regle "ne relance que si vide" : email vide ou statut invalide pour les emails,
+        telephone vide pour les mobiles. --force ignore la regle."""
+        if forcer:
+            return True
+        besoin = False
+        if "contact.emails" in champs:
+            besoin |= not (ligne.get("email") or "").strip() or (ligne.get("email_statut") or "").upper() in cls.STATUTS_INVALIDES
+        if "contact.phones" in champs:
+            besoin |= not (ligne.get("telephone") or "").strip()
+        return besoin
+
+    def enrichir_lignes(self, lignes: list[dict], champs: list[str], forcer: bool = False,
+                        dry_run: bool = False, nom: str = "module GTM", maximum: int | None = None) -> dict:
+        """Enrichit en place les lignes normalisees (lots de 100). Renvoie les compteurs.
+        Cout annonce avant tout appel : 1 credit par email pro trouve, 10 par mobile, facture au resultat."""
+        candidats = [(i, l) for i, l in enumerate(lignes) if self.a_enrichir(l, champs, forcer)]
+        if maximum:
+            candidats = candidats[:maximum]
+        entrees, sans_cle = [], 0
+        for i, l in candidats:
+            c = self.contact_depuis_ligne(l, champs)
+            if c is None:
+                sans_cle += 1
+                continue
+            c["custom"] = {"user_id": str(i)}
+            entrees.append(c)
+        credits_max = len(entrees) * ((1 if "contact.emails" in champs else 0) + (10 if "contact.phones" in champs else 0))
+        estimation = len(entrees) * ((0.6 if "contact.emails" in champs else 0) + (3 if "contact.phones" in champs else 0))
+        stats = {"lignes": len(lignes), "a_traiter": len(entrees), "deja_remplies": len(lignes) - len(candidats),
+                 "sans_cle_de_match": sans_cle, "credits_max": credits_max, "credits_estimes": round(estimation),
+                 "trouves": 0, "credits_factures": 0}
+        if dry_run:
+            bandeau_dry_run("FullEnrich contact/enrich/bulk",
+                            [f"{len(entrees)} contact(s) a enrichir sur {len(lignes)} ({stats['deja_remplies']} deja remplis, {sans_cle} sans prenom+nom+entreprise ni URL LinkedIn)",
+                             f"champs : {', '.join(champs)}",
+                             f"cout : au plus {credits_max} credits, environ {round(estimation)} au taux de match habituel (60 % emails, 30 % mobiles)"])
+            return stats
+        if not entrees:
+            afficher("  [fullenrich] rien a enrichir : toutes les lignes sont deja remplies ou sans cle de match")
+            return stats
+        solde = self.credits()
+        afficher(f"  [fullenrich] solde {solde} credits, cout max {credits_max}, estime {round(estimation)}")
+        if solde < round(estimation):
+            arret(f"FullEnrich : solde {solde} inferieur au cout estime {round(estimation)} credits. Rechargez ou reduisez avec --max.")
+        for debut in range(0, len(entrees), 100):
+            lot = entrees[debut:debut + 100]
+            eid = self.lancer(lot, nom=f"{nom} {debut // 100 + 1}")
+            afficher(f"  [fullenrich] lot {debut // 100 + 1} lance ({len(lot)} contacts, id {eid})")
+            res = self.attendre(eid)
+            stats["credits_factures"] += int(((res.get("cost") or {}).get("credits")) or 0)
+            for item in res.get("data", []):
+                plat = self.aplatir(item)
+                try:
+                    idx = int(plat["custom_id"])
+                except (TypeError, ValueError):
+                    continue
+                cible = lignes[idx]
+                if "contact.emails" in champs and plat["email"]:
+                    cible["email"], cible["email_statut"] = plat["email"], plat["email_statut"]
+                    stats["trouves"] += 1
+                elif "contact.emails" in champs and not cible.get("email_statut"):
+                    cible["email_statut"] = "NOT_FOUND"
+                if "contact.phones" in champs and plat["telephone"]:
+                    cible["telephone"] = plat["telephone"]
+                    stats["trouves"] += 1
+                if plat["titre_fullenrich"] and not cible.get("titre"):
+                    cible["titre"] = plat["titre_fullenrich"]
+            time.sleep(1)
+        afficher(f"  [fullenrich] {stats['trouves']} resultat(s) trouve(s), {stats['credits_factures']} credits factures, solde {self.credits()}")
+        return stats
+
+
+# ---------------------------------------------------------------- Crustdata
+
+class Crustdata:
+    """Client REST Crustdata. Cle : CRUSTDATA_API_KEY."""
+    BASE = "https://api.crustdata.com"
+
+    def __init__(self, exiger_cle: bool = True):
+        self.cle = env("CRUSTDATA_API_KEY", obligatoire=exiger_cle)
+
+    def _req(self, methode: str, chemin: str, body=None, params=None):
+        if not self.cle:
+            env("CRUSTDATA_API_KEY")
+        h = {"Authorization": f"Token {self.cle}", "Content-Type": "application/json"}
+        st, corps = http(methode, f"{self.BASE}{chemin}", headers=h, json_body=body, params=params)
+        if st == 402:
+            raise RuntimeError("Crustdata : credits insuffisants (HTTP 402)")
+        if st >= 400:
+            raise RuntimeError(f"Crustdata {methode} {chemin} -> HTTP {st} : {str(corps)[:300]}")
+        return corps
+
+    def credits(self):
+        return self._req("GET", "/user/credits").get("credits")
+
+    def entreprises(self, industry=None, employee_range=None, location=None, keywords=None, limit=50) -> list[dict]:
+        body = {"limit": limit}
+        for k, v in (("industry", industry), ("employee_range", employee_range), ("location", location), ("keywords", keywords)):
+            if v:
+                body[k] = v
+        return self._req("POST", "/v1/companies/search", body).get("results", [])
+
+    def entreprise(self, dom: str) -> dict:
+        res = self._req("GET", "/screener/company", params={"company_domain": dom})
+        return (res[0] if isinstance(res, list) and res else res) or {}
+
+    def personnes(self, entreprise=None, titres=None, seniorites=None, region=None, domaines=None,
+                  limit=100, cursor=None) -> dict:
+        conds = []
+        if entreprise:
+            conds.append({"column": "current_employers.name", "type": "[.]", "value": entreprise})
+        if domaines:
+            conds.append({"column": "current_employers.company_website_domain", "type": "in", "value": domaines})
+        if titres:
+            conds.append({"op": "or", "conditions": [{"column": "current_employers.title", "type": "[.]", "value": t} for t in titres]})
+        if seniorites:
+            conds.append({"column": "current_employers.seniority_level", "type": "in", "value": seniorites})
+        if region:
+            conds.append({"column": "region", "type": "[.]", "value": region})
+        if not conds:
+            raise ValueError("Crustdata : au moins un critere (entreprise, titres, seniorites, region, domaines)")
+        filtres = conds[0] if len(conds) == 1 else {"op": "and", "conditions": conds}
+        body = {"filters": filtres, "limit": min(limit, 1000)}
+        if cursor:
+            body["cursor"] = cursor
+        return self._req("POST", "/screener/persondb/search/", body)
+
+
+# ---------------------------------------------------------------- HubSpot
+
+class HubSpot:
+    """Client REST HubSpot (token Private App). Cle : HUBSPOT_ACCESS_TOKEN."""
+    BASE = "https://api.hubapi.com"
+
+    def __init__(self, exiger_cle: bool = True):
+        self.token = env("HUBSPOT_ACCESS_TOKEN", obligatoire=exiger_cle)
+
+    def _req(self, methode: str, chemin: str, body=None, params=None):
+        if not self.token:
+            env("HUBSPOT_ACCESS_TOKEN")
+        h = {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"}
+        st, corps = http(methode, f"{self.BASE}{chemin}", headers=h, json_body=body, params=params)
+        if st >= 400:
+            raise RuntimeError(f"HubSpot {methode} {chemin} -> HTTP {st} : {str(corps)[:300]}")
+        return corps
+
+    def test(self) -> dict:
+        return self._req("GET", "/crm/v3/objects/contacts", params={"limit": 1})
+
+    def contacts_par_email(self, emails: list[str], proprietes: list[str] | None = None) -> dict:
+        """{email minuscule: {id, props}} pour les emails connus du CRM (lots de 100)."""
+        trouves = {}
+        emails = sorted({e.lower().strip() for e in emails if e and "@" in e})
+        for i in range(0, len(emails), 100):
+            lot = emails[i:i + 100]
+            res = self._req("POST", "/crm/v3/objects/contacts/batch/read",
+                            {"idProperty": "email", "properties": ["email", "lifecyclestage"] + (proprietes or []),
+                             "inputs": [{"id": e} for e in lot]})
+            for it in res.get("results", []):
+                k = (it.get("properties", {}).get("email") or "").lower()
+                if k:
+                    trouves[k] = {"id": it["id"], "props": it.get("properties", {})}
+        return trouves
+
+    def entreprises_par_domaine(self, domaines: list[str]) -> dict:
+        """{domaine: id}. `domain` n'est pas une propriete unique : on passe par l'API search."""
+        trouves = {}
+        domaines = sorted({d.lower().strip() for d in domaines if d})
+        for i in range(0, len(domaines), 90):
+            lot = domaines[i:i + 90]
+            after = None
+            while True:
+                body = {"filterGroups": [{"filters": [{"propertyName": "domain", "operator": "IN", "values": lot}]}],
+                        "properties": ["domain", "name"], "limit": 100}
+                if after:
+                    body["after"] = after
+                res = self._req("POST", "/crm/v3/objects/companies/search", body)
+                for it in res.get("results", []):
+                    d = (it.get("properties", {}).get("domain") or "").lower()
+                    if d and d not in trouves:
+                        trouves[d] = it["id"]
+                after = ((res.get("paging") or {}).get("next") or {}).get("after")
+                if not after:
+                    break
+        return trouves
+
+
+# ---------------------------------------------------------------- PredictLeads (optionnel : evenements, levees, offres, technos datees)
+
+class PredictLeads:
+    """Client REST PredictLeads v3. Cles : PREDICTLEADS_API_KEY et PREDICTLEADS_API_TOKEN (en-tetes X-Api-Key, X-Api-Token).
+    Reponses au format JSON:API : data[] (attributes, relationships) + included[] (company_lite...). Facturation par
+    requete mensuelle selon l'abonnement : on ne pagine que si on le demande."""
+    BASE = "https://predictleads.com/api/v3"
+
+    def __init__(self, exiger_cle: bool = True):
+        self.cle = env("PREDICTLEADS_API_KEY", obligatoire=exiger_cle, aide="Cle et token sur predictleads.com, page API.")
+        self.token = env("PREDICTLEADS_API_TOKEN", obligatoire=exiger_cle)
+
+    def _req(self, chemin: str, params: dict | None = None) -> dict:
+        h = {"X-Api-Key": self.cle, "X-Api-Token": self.token, "Accept": "application/json"}
+        st, corps = http("GET", f"{self.BASE}{chemin}", headers=h, params={k: v for k, v in (params or {}).items() if v not in (None, "")})
+        if st == 401:
+            raise RuntimeError("PredictLeads 401 : cle ou token invalide, ou abonnement API inactif")
+        if st == 402:
+            raise RuntimeError("PredictLeads 402 : quota mensuel de requetes depasse")
+        if st >= 400:
+            raise RuntimeError(f"PredictLeads GET {chemin} -> HTTP {st} : {str(corps)[:300]}")
+        return corps if isinstance(corps, dict) else {}
+
+    def test(self) -> dict:
+        return self._req("/api_subscription")
+
+    @staticmethod
+    def _index_included(rep: dict) -> dict:
+        return {(it.get("type"), it.get("id")): it.get("attributes", {}) for it in rep.get("included", []) if isinstance(it, dict)}
+
+    def aplatir(self, rep: dict) -> list[dict]:
+        """Une ligne par element de data[], avec les attributs de l'entreprise liee (company_lite) fusionnes."""
+        inc = self._index_included(rep)
+        lignes = []
+        for it in rep.get("data", []) or []:
+            attrs = dict(it.get("attributes", {}))
+            attrs["_id"] = it.get("id", "")
+            attrs["_type"] = it.get("type", "")
+            rel = (it.get("relationships") or {})
+            comp = ((rel.get("company") or {}).get("data") or {})
+            if comp:
+                for cle, val in inc.get((comp.get("type"), comp.get("id")), {}).items():
+                    attrs.setdefault(f"company_{cle}", val)
+            for nom_rel in ("technology", "job_opening"):
+                r = ((rel.get(nom_rel) or {}).get("data") or {})
+                if r:
+                    for cle, val in inc.get((r.get("type"), r.get("id")), {}).items():
+                        attrs.setdefault(f"{nom_rel}_{cle}", val)
+            lignes.append(attrs)
+        return lignes
+
+    # decouverte sur un marche
+    def discover(self, dataset: str, params: dict, page: int = 1, limit: int = 100) -> list[dict]:
+        """dataset : financing_events, news_events, job_openings. params : filtres du dataset (voir docs)."""
+        return self.aplatir(self._req(f"/discover/{dataset}", {**params, "page": page, "limit": min(limit, 1000)}))
+
+    # par entreprise (domaine)
+    def par_entreprise(self, dom: str, dataset: str, params: dict | None = None) -> list[dict]:
+        """dataset : financing_events, news_events, job_openings, technology_detections."""
+        return self.aplatir(self._req(f"/companies/{dom}/{dataset}", {**(params or {}), "limit": 100}))
+
+
+# ---------------------------------------------------------------- TheirStack (optionnel : offres, technographies datees, intent jobs + techno)
+
+class TheirStack:
+    """Client REST TheirStack v1. Cle : THEIRSTACK_API_KEY (Bearer). 1 credit par offre ou par entreprise renvoyee ;
+    `blur_company_data: true` renvoie un apercu gratuit (entreprise floutee) pour compter avant de payer."""
+    BASE = "https://api.theirstack.com/v1"
+
+    def __init__(self, exiger_cle: bool = True):
+        self.cle = env("THEIRSTACK_API_KEY", obligatoire=exiger_cle, aide="Cle sur app.theirstack.com, Settings, API.")
+
+    def _post(self, chemin: str, body: dict) -> dict:
+        h = {"Authorization": f"Bearer {self.cle}", "Content-Type": "application/json", "Accept": "application/json"}
+        st, corps = http("POST", f"{self.BASE}{chemin}", headers=h, json_body=body)
+        if st == 401:
+            raise RuntimeError("TheirStack 401 : cle invalide")
+        if st == 402:
+            raise RuntimeError("TheirStack 402 : plus de credits")
+        if st >= 400:
+            raise RuntimeError(f"TheirStack POST {chemin} -> HTTP {st} : {str(corps)[:300]}")
+        return corps if isinstance(corps, dict) else {}
+
+    def test(self) -> dict:
+        return self._post("/jobs/search", {"limit": 1, "blur_company_data": True, "posted_at_max_age_days": 7, "job_country_code_or": ["FR"]})
+
+    def compter(self, chemin: str, body: dict) -> int:
+        """Nombre total de resultats sans consommer de credit (apercu floute, limit 1)."""
+        rep = self._post(chemin, {**body, "limit": 1, "blur_company_data": True, "include_total_results": True})
+        return int(((rep.get("metadata") or {}).get("total_results")) or 0)
+
+    def jobs(self, body: dict, limit: int = 50, page: int = 0) -> list[dict]:
+        rep = self._post("/jobs/search", {**body, "limit": min(limit, 500), "page": page, "blur_company_data": False})
+        return rep.get("data", []) or []
+
+    def entreprises(self, body: dict, limit: int = 50, page: int = 0) -> list[dict]:
+        rep = self._post("/companies/search", {**body, "limit": min(limit, 500), "page": page, "blur_company_data": False, "expand_technology_slugs": True})
+        return rep.get("data", []) or []
+
+    def technographies(self, dom: str, premiere_apres: str | None = None, confiances: list[str] | None = None, limit: int = 100) -> list[dict]:
+        """POST /companies/technologies : les technos d'une entreprise (nom, slug, categorie, confidence, first_date_found,
+        last_date_found, jobs, jobs_last_30_days). 3 credits par entreprise, 0 si rien n'est renvoye.
+        premiere_apres (YYYY-MM-DD) ne garde que les technos vues pour la premiere fois depuis cette date."""
+        body = {"company_domain": dom, "limit": min(limit, 500)}
+        if premiere_apres:
+            body["first_date_found_gte"] = premiere_apres
+        if confiances:
+            body["confidence_or"] = confiances
+        rep = self._post("/companies/technologies", body)
+        return rep.get("data", []) or []
+
+
+# ---------------------------------------------------------------- Lemlist (API REST, sans MCP)
+
+class Lemlist:
+    """Client REST Lemlist. Cle : LEMLIST_API_KEY. Authentification Basic avec login vide (":cle" en base64).
+    20 requetes par 2 secondes. `version=v2` obligatoire sur /campaigns et /activities."""
+    BASE = "https://api.lemlist.com/api"
+
+    def __init__(self, exiger_cle: bool = True):
+        self.cle = env("LEMLIST_API_KEY", obligatoire=exiger_cle, aide="Cle sur app.lemlist.com, Settings, Integrations, API.")
+
+    def _req(self, methode: str, chemin: str, body=None, params=None):
+        st, corps = http(methode, f"{self.BASE}{chemin}", json_body=body, params=params, auth=("", self.cle))
+        if st == 401:
+            raise RuntimeError("Lemlist 401 : cle invalide (rappel : auth Basic, login vide)")
+        if st >= 400:
+            raise RuntimeError(f"Lemlist {methode} {chemin} -> HTTP {st} : {str(corps)[:300]}")
+        time.sleep(0.12)  # 20 req / 2 s
+        return corps
+
+    def test(self) -> dict:
+        return self._req("GET", "/team")
+
+    def campagnes(self) -> list[dict]:
+        items, offset = [], 0
+        while True:
+            lot = self._req("GET", "/campaigns", params={"version": "v2", "limit": 100, "offset": offset})
+            lot = lot.get("campaigns", lot) if isinstance(lot, dict) else lot
+            items += lot or []
+            if not lot or len(lot) < 100:
+                break
+            offset += 100
+        return items
+
+    def creer_campagne(self, nom: str) -> dict:
+        return self._req("POST", "/campaigns", {"name": nom})
+
+    def ajouter_lead(self, campagne_id: str, lead: dict, dedoublonner: bool = True) -> dict:
+        """lead : email, firstName, lastName, companyName, companyDomain, linkedinUrl, phone, jobTitle, icebreaker + variables libres."""
+        return self._req("POST", f"/campaigns/{campagne_id}/leads/", lead,
+                         params={"deduplicate": "true" if dedoublonner else "false"})
+
+    def leads_campagne(self, campagne_id: str, etat: str | None = None, limite: int = 500) -> list[dict]:
+        params = {"limit": min(limite, 500)}
+        if etat:
+            params["state"] = etat
+        rep = self._req("GET", f"/campaigns/{campagne_id}/leads/", params=params)
+        return rep.get("leads", rep) if isinstance(rep, dict) else rep
+
+    def demarrer(self, campagne_id: str) -> dict:
+        return self._req("POST", f"/campaigns/{campagne_id}/start")
+
+    def pauser(self, campagne_id: str) -> dict:
+        return self._req("POST", f"/campaigns/{campagne_id}/pause")
+
+    def activites(self, type_: str, campagne_id: str | None = None, depuis: str | None = None, max_items: int = 500) -> list[dict]:
+        """type_ : emailsReplied, linkedinReplied, emailsBounced, emailsUnsubscribed, linkedinInviteAccepted... (pluriel exact)."""
+        items, offset = [], 0
+        while len(items) < max_items:
+            params = {"version": "v2", "type": type_, "limit": 100, "offset": offset}
+            if campagne_id:
+                params["campaignId"] = campagne_id
+            if depuis:
+                params["minDate"] = depuis
+            lot = self._req("GET", "/activities", params=params)
+            lot = lot.get("activities", lot) if isinstance(lot, dict) else lot
+            items += lot or []
+            if not lot or len(lot) < 100:
+                break
+            offset += 100
+        return items
+
+    def desinscrire(self, email: str) -> dict:
+        return self._req("POST", f"/unsubscribes/{email}")
+
+
+# ---------------------------------------------------------------- Ocean.io (API REST, sans MCP)
+
+# ---------------------------------------------------------------- Prospeo (recherche d'entreprises et de personnes, emails et mobiles verifies)
+
+class Prospeo:
+    """Client REST Prospeo (doc : prospeo.io/api-docs, lue le 2026-09-20). Cle : PROSPEO_API_KEY, en-tete X-KEY.
+    Tout est en POST sauf /account-information. Recherche : 1 credit par page de 25 avec au moins un resultat, gratuite
+    si la meme page a deja ete payee dans les 30 jours (`free: true`), 25 000 resultats max (1 000 pages).
+    /search-suggestions est gratuit (15 requetes par seconde) : lieux, titres, technos, industries, codes NAICS et SIC.
+    Enrichissement : 1 credit par email trouve, 10 par mobile (email compris), 0 sans resultat, 0 si deja enrichi depuis
+    moins de 90 jours ; jusqu'a 50 personnes ou entreprises par appel."""
+    BASE = "https://api.prospeo.io"
+    TAILLES = ["1-10", "11-20", "21-50", "51-100", "101-200", "201-500", "501-1000", "1001-2000", "2001-5000", "5001-10000", "10000+"]
+    TAILLES_DEPUIS_MODULE = {"1-10": ["1-10"], "11-50": ["11-20", "21-50"], "51-200": ["51-100", "101-200"], "201-500": ["201-500"],
+                             "501-1000": ["501-1000"], "1001-5000": ["1001-2000", "2001-5000"], "5001-10000": ["5001-10000"], "10001+": ["10000+"]}
+    SENIORITES = {"fondateur": "Founder/Owner", "founder": "Founder/Owner", "owner": "Founder/Owner", "cxo": "C-Suite", "c_level": "C-Suite",
+                  "c-suite": "C-Suite", "partner": "Partner", "associe": "Partner", "vp": "Vice President", "head": "Head",
+                  "director": "Director", "directeur": "Director", "manager": "Manager", "senior": "Senior", "entry": "Entry", "junior": "Entry"}
+    SENIORITE_VERS_MODULE = {"Founder/Owner": "fondateur", "C-Suite": "c_level", "Partner": "c_level", "Vice President": "vp", "Head": "head",
+                             "Director": "directeur", "Manager": "manager", "Senior": "senior", "Entry": "junior", "Intern": "junior"}
+    CA = ["<100K", "100K", "500K", "1M", "5M", "10M", "25M", "50M", "100M", "250M", "500M", "1B", "5B", "10B+"]
+    JOURS = [30, 60, 90, 180, 270, 365]
+    STATUT_EMAIL = {"VERIFIED": "DELIVERABLE", "UNVERIFIED": "UNKNOWN"}
+
+    def __init__(self, exiger_cle: bool = True, pause_s: float = 1.1):
+        self.cle = env("PROSPEO_API_KEY", obligatoire=exiger_cle, aide="Cle sur app.prospeo.io, Settings, API.")
+        self.pause_s = pause_s  # les recherches sont limitees a 1 par seconde sur le plan Starter
+
+    def _req(self, methode: str, chemin: str, body=None):
+        h = {"X-KEY": self.cle, "Content-Type": "application/json", "Accept": "application/json"}
+        st, corps = http(methode, f"{self.BASE}{chemin}", headers=h, json_body=body)
+        corps = corps if isinstance(corps, dict) else {}
+        if st == 429:
+            raise RuntimeError("Prospeo 429 : limite de requetes atteinte (recherche : 1 par seconde sur Starter), reessayez dans une minute")
+        if st >= 400 or corps.get("error"):
+            code = corps.get("error_code") or st
+            if code == "NO_RESULTS":
+                return {"error": False, "results": [], "pagination": {"total_count": 0, "total_page": 0, "current_page": 1}, "free": True}
+            if code == "INVALID_API_KEY":
+                raise RuntimeError("Prospeo : cle invalide (PROSPEO_API_KEY)")
+            if code == "INSUFFICIENT_CREDITS":
+                raise RuntimeError("Prospeo : plus de credits")
+            raise RuntimeError(f"Prospeo {chemin} -> {code} : {corps.get('filter_error') or corps.get('message') or str(corps)[:300]}")
+        return corps
+
+    # ---- compte
+    def compte(self) -> dict:
+        return self._req("GET", "/account-information").get("response") or {}
+
+    def solde(self) -> str:
+        c = self.compte()
+        return f"{c.get('remaining_credits', '?')} credits restants (plan {c.get('current_plan', '?')}, {c.get('used_credits', 0)} utilises)"
+
+    # ---- referentiels (gratuits)
+    def suggestions(self, genre: str, mots: str) -> list:
+        """genre : location, job_title, technology, industry, naics, sic, ou un champ entreprise (company_icp_titles,
+        company_key_customers, company_integrations, company_products_services_products, company_funding_investors...).
+        Rend les libelles canoniques a recopier tels quels."""
+        cle = f"{genre}_search"
+        rep = self._req("POST", "/search-suggestions", {cle: mots})
+        for k, v in rep.items():
+            if k.endswith("_suggestions") and v:
+                return [x.get("name") if isinstance(x, dict) else x for x in v]
+        return []
+
+    def resoudre(self, genre: str, valeurs: list[str], libelle: str) -> list[str]:
+        """Chaque valeur devient un libelle canonique : exact si la suggestion l'egale (sans casse), sinon la premiere
+        suggestion, annoncee. Sans suggestion, arret : le filtre renverrait zero resultat en silence."""
+        sortie = []
+        for v in valeurs:
+            sugg = self.suggestions(genre, v)
+            exact = next((s for s in sugg if s.lower() == v.lower()), None)
+            if exact:
+                sortie.append(exact)
+            elif sugg:
+                afficher(f"  [prospeo] {libelle} '{v}' -> {sugg[0]}" + (f" ; autres : {', '.join(sugg[1:5])}" if len(sugg) > 1 else ""))
+                sortie.append(sugg[0])
+            else:
+                raise RuntimeError(f"{libelle} '{v}' inconnu de Prospeo : essayez un autre mot (les valeurs se cherchent avec --lister-{libelle}s)")
+        return sortie
+
+    # ---- recherche
+    def _page(self, chemin: str, filtres: dict, page: int) -> dict:
+        return self._req("POST", chemin, {"filters": filtres, "page": page})
+
+    def total(self, chemin: str, filtres: dict) -> tuple[int, dict]:
+        """(total_count, reponse de la page 1). La page 1 coute 1 credit, et donne 25 premiers resultats."""
+        rep = self._page(chemin, filtres, 1)
+        return int((rep.get("pagination") or {}).get("total_count") or 0), rep
+
+    def rechercher(self, chemin: str, filtres: dict, max_resultats: int = 100) -> tuple[list[dict], int, int]:
+        """(resultats, total, pages facturees). Pages de 25, une pause entre deux pages."""
+        items, pages_payees, total, page = [], 0, 0, 1
+        while len(items) < max_resultats and page <= 1000:
+            rep = self._page(chemin, filtres, page)
+            lot = rep.get("results") or []
+            pag = rep.get("pagination") or {}
+            total = int(pag.get("total_count") or total)
+            if lot and not rep.get("free"):
+                pages_payees += 1
+            items += lot
+            if not lot or page >= int(pag.get("total_page") or 1):
+                break
+            page += 1
+            time.sleep(self.pause_s)
+        return items[:max_resultats], total, pages_payees
+
+    def personnes(self, filtres: dict, max_resultats: int = 100) -> tuple[list[dict], int, int]:
+        return self.rechercher("/search-person", filtres, max_resultats)
+
+    def entreprises(self, filtres: dict, max_resultats: int = 100) -> tuple[list[dict], int, int]:
+        return self.rechercher("/search-company", filtres, max_resultats)
+
+    # ---- enrichissement (revelation des emails et mobiles)
+    def enrichir_personnes(self, data: list[dict], email_verifie_seulement: bool = True, mobile: bool = False,
+                           mobile_verifie_seulement: bool = False) -> tuple[dict, list[str], int]:
+        """data : [{identifier, person_id | linkedin_url | first_name + last_name + company_website...}], 50 par appel.
+        Rend ({identifier: {person, company}}, non_trouves, credits factures)."""
+        trouves, non, cout = {}, [], 0
+        for i in range(0, len(data), 50):
+            body = {"only_verified_email": email_verifie_seulement, "enrich_mobile": mobile, "only_verified_mobile": mobile_verifie_seulement,
+                    "data": data[i:i + 50]}
+            rep = self._req("POST", "/bulk-enrich-person", body)
+            for m in rep.get("matched") or []:
+                trouves[str(m.get("identifier"))] = m
+            non += [str(x) for x in (rep.get("not_matched") or [])] + [str(x) for x in (rep.get("invalid_datapoints") or [])]
+            cout += int(rep.get("total_cost") or 0)
+            if i + 50 < len(data):
+                time.sleep(0.3)
+        return trouves, non, cout
+
+    def enrichir_entreprises(self, data: list[dict]) -> tuple[dict, list[str], int]:
+        """data : [{identifier, company_website | company_linkedin_url | company_name | company_id}], 50 par appel, 1 credit par entreprise."""
+        trouves, non, cout = {}, [], 0
+        for i in range(0, len(data), 50):
+            rep = self._req("POST", "/bulk-enrich-company", {"data": data[i:i + 50]})
+            for m in rep.get("matched") or []:
+                trouves[str(m.get("identifier"))] = m.get("company") or m
+            non += [str(x) for x in (rep.get("not_matched") or [])] + [str(x) for x in (rep.get("invalid_datapoints") or [])]
+            cout += int(rep.get("total_cost") or 0)
+            if i + 50 < len(data):
+                time.sleep(0.3)
+        return trouves, non, cout
+
+    # ---- normalisation
+    @staticmethod
+    def normaliser_entreprise(c: dict) -> dict:
+        c = c.get("company", c) if isinstance(c, dict) and "company" in c and isinstance(c.get("company"), dict) else c
+        loc = c.get("location") or {}
+        fund = c.get("funding") or {}
+        tech = c.get("technology") or {}
+        technos = tech.get("technologies") if isinstance(tech, dict) else tech
+        if isinstance(technos, list):
+            technos = " | ".join(x.get("name") if isinstance(x, dict) else str(x) for x in technos)[:1000]
+        else:
+            technos = ""
+        return {"entreprise": c.get("name") or "", "domaine": domaine(c.get("domain") or c.get("website") or ""),
+                "linkedin_entreprise_url": norm_linkedin_url(c.get("linkedin_url") or ""), "site_web": c.get("website") or "",
+                "ville": loc.get("city") or "", "pays": (loc.get("country_code") or loc.get("country") or "").upper(),
+                "secteur": c.get("industry") or "", "effectif": c.get("employee_range") or "", "effectif_linkedin": c.get("employee_count") or "",
+                "chiffre_affaires": c.get("revenue_range_printed") or "", "annee_creation": c.get("founded") or "",
+                "type": c.get("type") or "", "description": (c.get("description_ai") or c.get("description_seo") or c.get("description") or "")[:500],
+                "mots_cles": " | ".join(c.get("keywords") or [])[:500], "technos": technos,
+                "financement": f"{fund.get('latest_funding_stage') or ''} {str(fund.get('latest_funding_date') or '')[:10]}".strip(),
+                "financement_total": fund.get("total_funding_printed") or "",
+                "telephone_entreprise": (c.get("phone_hq") or {}).get("phone_hq") or "" if isinstance(c.get("phone_hq"), dict) else "",
+                "prospeo_company_id": c.get("company_id") or "", "source": "prospeo", "date_extraction": aujourd_hui()}
+
+    @classmethod
+    def normaliser_personne(cls, r: dict) -> dict:
+        p = r.get("person") or r
+        c = r.get("company") or {}
+        job = next((j for j in (p.get("job_history") or []) if isinstance(j, dict) and j.get("current")), {})
+        sen = job.get("seniority") or (p.get("seniority") or "")
+        loc = p.get("location") or {}
+        em = p.get("email") or {}
+        mo = p.get("mobile") or {}
+        ligne = {"prenom": p.get("first_name") or "", "nom": p.get("last_name") or "", "titre": p.get("current_job_title") or job.get("title") or "",
+                 "seniorite": cls.SENIORITE_VERS_MODULE.get(sen, seniorite_depuis_titre(p.get("current_job_title") or "")),
+                 "entreprise": c.get("name") or job.get("company_name") or "", "domaine": domaine(c.get("domain") or c.get("website") or ""),
+                 "linkedin_url": norm_linkedin_url(p.get("linkedin_url") or ""), "linkedin_entreprise_url": norm_linkedin_url(c.get("linkedin_url") or ""),
+                 "ville": loc.get("city") or "", "pays": (loc.get("country_code") or "").upper(), "headline": p.get("headline") or "",
+                 "secteur": c.get("industry") or "", "effectif": c.get("employee_range") or "",
+                 "email_statut_prospeo": em.get("status") or "", "mobile_statut_prospeo": mo.get("status") or "",
+                 "anciennete_poste": f"{job.get('duration_in_months')} mois" if job.get("duration_in_months") else "",
+                 "prospeo_person_id": p.get("person_id") or "", "prospeo_company_id": c.get("company_id") or "",
+                 "source": "prospeo", "date_extraction": aujourd_hui()}
+        if em.get("revealed") and em.get("email") and "*" not in em["email"]:
+            ligne["email"] = em["email"]
+            ligne["email_statut"] = cls.STATUT_EMAIL.get(em.get("status") or "", "UNKNOWN")
+        if mo.get("revealed") and mo.get("mobile") and "*" not in mo["mobile"]:
+            ligne["telephone"] = mo.get("mobile_international") or mo["mobile"]
+        if p.get("last_job_change_detected_at"):
+            ligne["changement_poste_detecte_le"] = str(p["last_job_change_detected_at"])[:10]
+        return ligne
+
+
+class Ocean:
+    """Client REST Ocean.io (doc : app.ocean.io/docs, spec OpenAPI 2.0.0 lue le 2026-09-20). Cle : OCEAN_API_KEY,
+    en-tete X-Api-Token. Chemins : https://api.ocean.io/api/public_api/v2 et /v3. Chaque reponse de recherche porte
+    `total` (nombre de resultats, toutes pages) et `creditsUsed` (credits factures) : le script affiche les deux.
+    /preview est reserve aux comptes Enterprise : on l'essaie, sinon on compte avec une recherche de taille 1."""
+    BASE = "https://api.ocean.io/api/public_api"
+    CHAMPS_ENTREPRISE = ["name", "domain", "rootUrl", "medias", "locations", "primaryCountry", "companySize", "employeeCountLinkedin",
+                         "industries", "industryCategories", "linkedinIndustry", "keywords", "technologies", "revenue", "yearFounded",
+                         "description", "fundingRound", "phones", "emails", "headcountGrowth"]
+    CHAMPS_PERSONNE = ["id", "firstName", "lastName", "name", "jobTitle", "jobTitleEnglish", "seniorities", "departments", "linkedinUrl",
+                       "location", "country", "headline", "domain", "company", "connectionsCount", "followersCount"]
+    TAILLES = ["0-1", "2-10", "11-50", "51-200", "201-500", "501-1000", "1001-5000", "5001-10000", "10001-50000", "50001-100000",
+               "100001-500000", "500000+"]
+    CA = ["0-1M", "1-10M", "10-50M", "50-100M", "100-500M", "500-1000M", ">1000M"]
+    SENIORITES = {"fondateur": "Founder", "founder": "Founder", "owner": "Owner", "proprietaire": "Owner", "board": "Board Member",
+                  "cxo": "C-Level", "c_level": "C-Level", "c-level": "C-Level", "partner": "Partner", "associe": "Partner", "vp": "VP",
+                  "head": "Head", "director": "Director", "directeur": "Director", "manager": "Manager", "senior": "Senior",
+                  "professional": "Professional", "entry": "Entry", "junior": "Entry"}
+    SENIORITE_VERS_MODULE = {"Founder": "fondateur", "Owner": "fondateur", "Board Member": "c_level", "C-Level": "c_level", "Partner": "c_level",
+                             "VP": "vp", "Head": "head", "Director": "directeur", "Manager": "manager", "Senior": "senior",
+                             "Professional": "senior", "Entry": "junior", "Intern": "junior", "Other": "autre"}
+
+    def __init__(self, exiger_cle: bool = True):
+        self.cle = env("OCEAN_API_KEY", obligatoire=exiger_cle, aide="Token sur app.ocean.io, Settings, API tokens (admin).")
+        self._data_fields = None
+
+    def _req(self, methode: str, chemin: str, body=None, params=None):
+        h = {"X-Api-Token": self.cle, "Content-Type": "application/json", "Accept": "application/json"}
+        st, corps = http(methode, f"{self.BASE}{chemin}", headers=h, json_body=body, params=params)
+        if st in (401, 403):
+            raise RuntimeError(f"Ocean.io {st} : token invalide, absent, ou endpoint reserve a un autre plan ({str(corps)[:120]})")
+        if st == 402:
+            raise RuntimeError("Ocean.io 402 : plus de credits")
+        if st >= 400:
+            raise RuntimeError(f"Ocean.io {methode} {chemin} -> HTTP {st} : {str(corps)[:300]}")
+        return corps if isinstance(corps, dict) else {}
+
+    # ---- compte
+    def credits(self) -> dict:
+        """{'credits': {'oneTime', 'recurrent'}, 'emailCredits', 'phoneCredits', 'previewCredits', 'dailyLimitRateLeft'}."""
+        return self._req("GET", "/v2/credits/balance")
+
+    def solde(self) -> str:
+        c = self.credits().get("credits") or {}
+        return f"{(c.get('recurrent') or 0) + (c.get('oneTime') or 0)} credits (recurrents {c.get('recurrent', 0)}, ponctuels {c.get('oneTime', 0)})"
+
+    # ---- referentiels (gratuits)
+    def data_fields(self) -> dict:
+        """Industries, categories d'industrie, industries LinkedIn, technologies, regions, seniorites, departements. Gratuit."""
+        if self._data_fields is None:
+            self._data_fields = self._req("GET", "/v2/data-fields")
+        return self._data_fields
+
+    def chercher_referentiel(self, cle: str, mots: str, limite: int = 15) -> list[str]:
+        """Les valeurs d'un referentiel (industries, industryCategories, linkedinIndustries, technologies, departments...)
+        qui contiennent chaque mot demande, sans accent ni casse."""
+        valeurs = self.data_fields().get(cle) or []
+        if isinstance(valeurs, dict):
+            valeurs = list(valeurs.keys())
+        noms = [v if isinstance(v, str) else (v.get("name") or v.get("title") or str(v)) for v in valeurs]
+        termes = [norm_texte(m) for m in re.split(r"[ ,]+", mots) if m.strip()]
+        return [n for n in noms if all(t in norm_texte(n) for t in termes)][:limite]
+
+    def autocomplete(self, genre: str, mots: str, limite: int = 10, type_lieu: str | None = None) -> list:
+        """genre : keywords, locations, job-titles, companies, skills. Rend la liste brute de l'API."""
+        body = {"query": mots, "limit": limite}
+        if type_lieu:
+            body["locationType"] = type_lieu
+        rep = self._req("POST", f"/v2/autocomplete/{genre}", body)
+        for k in ("keywords", "locations", "jobTitles", "companies", "skills"):
+            if k in rep:
+                return rep[k] or []
+        return []
+
+    # ---- entreprises
+    def rechercher_entreprises(self, filtres: dict, size: int = 50, search_after: str | None = None, fields: list[str] | None = None,
+                               people_filters: dict | None = None) -> dict:
+        body = {"companiesFilters": filtres, "size": max(1, min(size, 10000)), "fields": fields or self.CHAMPS_ENTREPRISE}
+        if people_filters:
+            body["peopleFilters"] = people_filters
+        if search_after:
+            body["searchAfter"] = search_after
+        return self._req("POST", "/v3/search/companies", body)
+
+    def total_entreprises(self, filtres: dict, people_filters: dict | None = None) -> tuple[int, str]:
+        """(total, comment on l'a eu). /preview d'abord (gratuit, Enterprise) ; sinon une recherche de taille 1."""
+        try:
+            body = {"companiesFilters": filtres}
+            if people_filters:
+                body["peopleFilters"] = people_filters
+            rep = self._req("POST", "/v3/search/companies/preview", body)
+            return int(rep.get("total") or rep.get("count") or 0), "apercu gratuit"
+        except RuntimeError:
+            rep = self.rechercher_entreprises(filtres, size=1, fields=["domain"], people_filters=people_filters)
+            return int(rep.get("total") or 0), f"recherche de taille 1 ({rep.get('creditsUsed', '?')} credit(s))"
+
+    def entreprises(self, filtres: dict, max_resultats: int = 100, taille_page: int = 50, fields: list[str] | None = None,
+                    people_filters: dict | None = None) -> tuple[list[dict], int, float]:
+        """(entreprises, total, credits factures)."""
+        items, after, total, credits = [], None, 0, 0.0
+        while len(items) < max_resultats:
+            rep = self.rechercher_entreprises(filtres, size=min(taille_page, max_resultats - len(items)), search_after=after,
+                                              fields=fields, people_filters=people_filters)
+            lot = rep.get("companies") or []
+            items += lot
+            total = int(rep.get("total") or total)
+            credits += float(rep.get("creditsUsed") or 0)
+            after = rep.get("searchAfter")
+            if not lot or not after:
+                break
+        return items[:max_resultats], total, credits
+
+    def lookup_entreprises(self, domaines: list[str], fields: list[str] | None = None) -> tuple[dict, float]:
+        """POST /v2/lookup/companies (1 000 domaines max par appel) : {domaine: entreprise ou None}, credits factures."""
+        resultat, credits = {}, 0.0
+        for i in range(0, len(domaines), 1000):
+            rep = self._req("POST", "/v2/lookup/companies", {"domains": domaines[i:i + 1000], "fields": fields or self.CHAMPS_ENTREPRISE})
+            for it in rep.get("companies") or []:
+                if isinstance(it, dict) and it.get("domain"):
+                    resultat[domaine(it["domain"])] = it
+            for src, dst in (rep.get("redirectMap") or {}).items():
+                if dst in resultat and domaine(src) not in resultat:
+                    resultat[domaine(src)] = resultat[dst]
+            credits += float(rep.get("creditsUsed") or 0)
+        return resultat, credits
+
+    # ---- personnes
+    def rechercher_personnes(self, people_filters: dict, companies_filters: dict | None = None, size: int = 50,
+                             par_entreprise: int | None = None, search_after: str | None = None, fields: list[str] | None = None) -> dict:
+        body = {"peopleFilters": people_filters, "size": max(1, min(size, 10000)), "fields": fields or self.CHAMPS_PERSONNE}
+        if companies_filters:
+            body["companiesFilters"] = companies_filters
+        if par_entreprise:
+            body["peoplePerCompany"] = par_entreprise
+        if search_after:
+            body["searchAfter"] = search_after
+        return self._req("POST", "/v3/search/people", body)
+
+    def personnes(self, people_filters: dict, companies_filters: dict | None = None, max_resultats: int = 100, taille_page: int = 50,
+                  par_entreprise: int | None = None, fields: list[str] | None = None) -> tuple[list[dict], int, float]:
+        items, after, total, credits = [], None, 0, 0.0
+        while len(items) < max_resultats:
+            rep = self.rechercher_personnes(people_filters, companies_filters, size=min(taille_page, max_resultats - len(items)),
+                                            par_entreprise=par_entreprise, search_after=after, fields=fields)
+            lot = rep.get("people") or []
+            items += lot
+            total = int(rep.get("total") or total)
+            credits += float(rep.get("creditsUsed") or 0)
+            after = rep.get("searchAfter")
+            if not lot or not after:
+                break
+        return items[:max_resultats], total, credits
+
+    # ---- normalisation vers les colonnes du module
+    @staticmethod
+    def normaliser_entreprise(c: dict) -> dict:
+        locs = c.get("locations") or []
+        prim = next((l for l in locs if isinstance(l, dict) and l.get("primary")), locs[0] if locs and isinstance(locs[0], dict) else {})
+        medias = c.get("medias") or {}
+        fr = c.get("fundingRound") or {}
+        techs = c.get("technologies") or []
+        return {"entreprise": c.get("name") or c.get("legalName") or "", "domaine": domaine(c.get("domain") or c.get("rootUrl") or ""),
+                "linkedin_entreprise_url": norm_linkedin_url(medias.get("linkedin") or ""), "site_web": c.get("rootUrl") or "",
+                "ville": prim.get("locality") or "", "pays": (prim.get("country") or c.get("primaryCountry") or "").upper(),
+                "secteur": " | ".join(c.get("industries") or []) if isinstance(c.get("industries"), list) else (c.get("industries") or ""),
+                "industrie_linkedin": c.get("linkedinIndustry") or "", "effectif": c.get("companySize") or "",
+                "effectif_linkedin": c.get("employeeCountLinkedin") or "", "chiffre_affaires": c.get("revenue") or "",
+                "annee_creation": c.get("yearFounded") or "", "description": (c.get("description") or "")[:500],
+                "technos": " | ".join(x if isinstance(x, str) else (x.get("name") or "") for x in techs)[:1000],
+                "mots_cles": " | ".join(c.get("keywords") or [])[:500],
+                "financement": f"{fr.get('type') or ''} {fr.get('date') or ''}".strip(), "financement_montant": fr.get("moneyRaisedInUsd") or "",
+                "telephone_entreprise": next((ph.get("number") for ph in (c.get("phones") or []) if isinstance(ph, dict) and ph.get("number")), ""),
+                "source": "ocean", "date_extraction": aujourd_hui()}
+
+    @classmethod
+    def normaliser_personne(cls, p: dict) -> dict:
+        comp = p.get("company") or {}
+        sen = p.get("seniorities") or []
+        sen = sen[0] if isinstance(sen, list) and sen else (sen if isinstance(sen, str) else "")
+        prenom, nom = p.get("firstName") or "", p.get("lastName") or ""
+        if not prenom and p.get("name"):
+            parts = p["name"].split(" ", 1)
+            prenom, nom = parts[0], parts[1] if len(parts) > 1 else ""
+        return {"prenom": prenom, "nom": nom, "titre": p.get("jobTitle") or p.get("jobTitleEnglish") or "",
+                "seniorite": cls.SENIORITE_VERS_MODULE.get(sen, seniorite_depuis_titre(p.get("jobTitle") or "")),
+                "entreprise": comp.get("name") or "", "domaine": domaine(p.get("domain") or comp.get("domain") or ""),
+                "linkedin_url": norm_linkedin_url(p.get("linkedinUrl") or ""),
+                "linkedin_entreprise_url": norm_linkedin_url(((comp.get("medias") or {}).get("linkedin")) or ""),
+                "ville": p.get("location") or "", "pays": (p.get("country") or "").upper(), "headline": p.get("headline") or "",
+                "departement": " | ".join(p.get("departments") or []) if isinstance(p.get("departments"), list) else "",
+                "ocean_id": p.get("id") or "", "source": "ocean", "date_extraction": aujourd_hui()}
+
+    # ---- lookalikes (compatibilite trouver_lookalikes.py)
+    def _filtres(self, domaines: list[str], pays: list[str] | None, tailles: list[str] | None, exclure: list[str] | None) -> dict:
+        f = {"lookalikeDomains": domaines}
+        if pays:
+            f["primaryLocations"] = {"includeCountries": [p.lower() for p in pays]}
+        if tailles:
+            f["companySizes"] = tailles
+        if exclure:
+            f["excludeDomains"] = exclure
+        return f
+
+    def apercu_lookalikes(self, domaines, pays=None, tailles=None, exclure=None) -> int:
+        total, comment = self.total_entreprises(self._filtres(domaines, pays, tailles, exclure))
+        afficher(f"  [ocean] total obtenu par {comment}")
+        return total
+
+    def lookalikes(self, domaines, taille_page: int = 50, max_resultats: int = 100, pays=None, tailles=None, exclure=None) -> list[dict]:
+        items, total, credits = self.entreprises(self._filtres(domaines, pays, tailles, exclure), max_resultats=max_resultats, taille_page=taille_page)
+        afficher(f"  [ocean] {len(items)} entreprise(s) sur {total}, {credits} credit(s) factures")
+        return items
+
+
+class Publora:
+    """Client REST Publora (spec OpenAPI lue sur docs.publora.com le 2026-09-20). Cle : PUBLORA_API_KEY, en-tete
+    x-publora-key, base https://api.publora.com/api/v1. Programme des posts sur les comptes connectes dans le tableau
+    de bord Publora (LinkedIn, X, Facebook, Instagram, Threads, TikTok, YouTube, Bluesky, Mastodon, Telegram).
+    Abonnement, pas de cout par appel : palier gratuit de 15 posts par mois, Pro illimite.
+    Heures en ISO 8601 UTC ; un post sans scheduledTime est un brouillon ; une heure passee est ramenee a maintenant
+    avec l'avertissement SCHEDULED_TIME_COERCED (le script refuse avant d'envoyer)."""
+    BASE = "https://api.publora.com/api/v1"
+
+    def __init__(self, exiger_cle: bool = True):
+        self.cle = env("PUBLORA_API_KEY", obligatoire=exiger_cle,
+                       aide="Cle sur publora.com, menu API (ou Settings, API Keys), bouton Generate API Key : affichee une seule fois.")
+
+    def _req(self, methode: str, chemin: str, body=None, params=None, timeout: int = 60):
+        h = {"x-publora-key": self.cle, "Content-Type": "application/json", "Accept": "application/json"}
+        st, corps = http(methode, f"{self.BASE}{chemin}", headers=h, json_body=body, params=params, timeout=timeout)
+        corps = corps if isinstance(corps, dict) else {"error": str(corps)[:300]}
+        if st == 401:
+            raise RuntimeError("Publora 401 : cle invalide ou revoquee (PUBLORA_API_KEY)")
+        if st == 429:
+            raise RuntimeError(f"Publora 429 : limite atteinte, reessayez dans {corps.get('retryAfterSec', 60)} s")
+        if st >= 400:
+            raise RuntimeError(f"Publora {methode} {chemin} : HTTP {st} {corps.get('code') or ''} {corps.get('error') or ''}".strip())
+        return corps
+
+    # ---- comptes
+    def comptes(self) -> list[dict]:
+        """Les comptes connectes : platformId (ex. linkedin-Tz9W5i6ZYG), username, displayName, profileUrl, tokenStatus."""
+        return self._req("GET", "/platform-connections").get("connections") or []
+
+    def comptes_linkedin(self) -> list[dict]:
+        return [c for c in self.comptes() if str(c.get("platformId", "")).startswith("linkedin")]
+
+    def tester_compte(self, platform_id: str) -> dict:
+        return self._req("POST", f"/test-connection/{platform_id}")
+
+    def limites(self) -> dict:
+        return self._req("GET", "/platform-limits")
+
+    # ---- posts
+    def creer(self, contenu: str, platform_ids: list[str], quand_utc: str | None = None, media_urls: list[str] | None = None,
+              reglages: dict | None = None, idempotence: str | None = None) -> dict:
+        body = {"content": contenu, "platforms": platform_ids}
+        if quand_utc:
+            body["scheduledTime"] = quand_utc
+        if media_urls:
+            body["mediaUrls"] = media_urls
+        if reglages:
+            body["platformSettings"] = reglages
+        h_extra = {"Idempotency-Key": idempotence} if idempotence else {}
+        h = {"x-publora-key": self.cle, "Content-Type": "application/json", "Accept": "application/json", **h_extra}
+        st, corps = http("POST", f"{self.BASE}/create-post", headers=h, json_body=body)
+        corps = corps if isinstance(corps, dict) else {"error": str(corps)[:300]}
+        if st >= 400:
+            raise RuntimeError(f"Publora create-post : HTTP {st} {corps.get('code') or ''} {corps.get('error') or ''}".strip())
+        return corps
+
+    def lire(self, post_group_id: str) -> dict:
+        return self._req("GET", f"/get-post/{post_group_id}")
+
+    def modifier(self, post_group_id: str, **champs) -> dict:
+        """Champs acceptes : content, platforms (liste complete), status (draft|scheduled), scheduledTime, platformSettings, mediaUrls."""
+        return self._req("PUT", f"/update-post/{post_group_id}", body={k: v for k, v in champs.items() if v is not None})
+
+    def supprimer(self, post_group_id: str) -> dict:
+        return self._req("DELETE", f"/delete-post/{post_group_id}")
+
+    def lister(self, statut: str | None = None, plateforme: str | None = None, depuis: str | None = None, jusqu_a: str | None = None,
+               page: int = 1, limite: int = 50, tri: str = "scheduledTime", ordre: str = "asc") -> dict:
+        params = {"page": page, "limit": limite, "sortBy": tri, "sortOrder": ordre}
+        if statut:
+            params["status"] = statut
+        if plateforme:
+            params["platform"] = plateforme
+        if depuis:
+            params["fromDate"] = depuis
+        if jusqu_a:
+            params["toDate"] = jusqu_a
+        return self._req("GET", "/list-posts", params=params)
+
+    def journal(self, post_group_id: str) -> dict:
+        return self._req("GET", f"/post-logs/{post_group_id}")
+
+    # ---- media (fichier local : URL presignee, PUT, puis probe)
+    def televerser(self, post_group_id: str, chemin: Path, type_media: str | None = None) -> dict:
+        import mimetypes
+        ctype = mimetypes.guess_type(str(chemin))[0] or "application/octet-stream"
+        body = {"fileName": chemin.name, "contentType": ctype, "postGroupId": post_group_id}
+        if type_media:
+            body["type"] = type_media
+        rep = self._req("POST", "/get-upload-url", body=body)
+        url, media_id = rep.get("uploadUrl"), rep.get("mediaId")
+        if not url:
+            raise RuntimeError(f"Publora get-upload-url : pas d'uploadUrl ({str(rep)[:200]})")
+        r = requests.put(url, data=chemin.read_bytes(), headers={"Content-Type": ctype}, timeout=300)
+        if r.status_code >= 300:
+            raise RuntimeError(f"Publora televersement : HTTP {r.status_code} {r.text[:200]}")
+        try:
+            fin = self._req("POST", f"/complete-media/{media_id}")
+        except RuntimeError:
+            fin = {}
+        return {"mediaId": media_id, "fileUrl": rep.get("fileUrl"), "probe": fin.get("mediaFile") or {}}
+
+    # ---- LinkedIn : commentaire et statistiques (apres publication)
+    def commenter_linkedin(self, platform_id: str, posted_id: str, message: str, parent: str | None = None) -> dict:
+        body = {"postedId": posted_id, "message": message, "platformId": platform_id}
+        if parent:
+            body["parentComment"] = parent
+        return self._req("POST", "/linkedin-comments", body=body)
+
+    def stats_post_linkedin(self, platform_id: str, posted_id: str) -> dict:
+        rep = self._req("POST", "/linkedin-post-statistics", body={"postedId": posted_id, "platformId": platform_id, "queryTypes": "ALL"})
+        return rep.get("metrics") or {}
+
+    def stats_compte_linkedin(self, platform_id: str, aggregation: str = "TOTAL") -> dict:
+        rep = self._req("POST", "/linkedin-account-statistics", body={"platformId": platform_id, "queryTypes": "ALL", "aggregation": aggregation})
+        return rep.get("metrics") or {}

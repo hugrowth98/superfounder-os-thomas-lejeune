@@ -1,0 +1,91 @@
+---
+name: sourcer-personnes
+description: >
+  Trouve les bonnes personnes chez les entreprises cibles : titres et booléens par
+  persona, recherche Sales Navigator, employés d'une page entreprise, puis profil enrichi
+  et email vérifié. Se déclenche sur : "trouve les DRH de", "les CEO de ces boîtes",
+  "décisionnaires", "qui contacter chez", "booléen", "Sales Nav", "employés de ces
+  entreprises", "à partir de cette liste d'entreprises". Ne pas utiliser pour trouver
+  les entreprises (voir `sourcer-entreprises`), pour définir les personas (voir
+  `cartographier-personas`), ni pour vérifier des emails existants (voir
+  `nettoyer-verifier`).
+---
+
+On part d'une liste d'entreprises qualifiées et de personas écrits, jamais d'une recherche de personnes dans le vide : une liste d'entreprises se retrouve presque à coup sûr sur LinkedIn, une liste de personnes beaucoup moins, et les contacts se paient à la ligne.
+
+## Ressources
+
+- `{SKILL_BASE}/ressources/personas-comite-achat.md` : titres par fonction, ATL et BTL, exclusions de booléen.
+- `{SKILL_BASE}/ressources/sources-par-besoin.md` : recherche par critères ou par page entreprise, la limite des 2 500.
+- `{SKILL_BASE}/ressources/hygiene-liste.md` : la règle "ne relance que si vide", l'ordre d'entrée le moins cher.
+- `{SKILL_BASE}/ressources/prospeo-recherche.md` : si Prospeo est branché, les titres similaires avec expansion, le plafond par entreprise, les emails et mobiles vérifiés révélés en lot, et le contrôle sur 20 adresses.
+
+## Méthode
+
+1. Point de départ : un CSV d'entreprises passé par `qualifier-comptes` (tiers A et B, `exclu = non`), ou des critères d'entreprise si l'utilisateur n'a pas encore de liste. Dans ce second cas, faites d'abord `sourcer-entreprises`.
+2. Lisez les personas dans `05_Departements/Go-to-Market/contexte.md`. Un persona, une recherche, un CSV. Les titres du persona deviennent un booléen : `("Directeur commercial" OR "Directrice commerciale" OR "Head of Sales" OR CRO) NOT (assistant OR stagiaire OR alternant OR "à la recherche")`. Le booléen marche dans le champ titre, entreprise et mots-clés, pas dans les filtres à choix ; pas de joker ; moins de 1 000 caractères ; parenthèses sur deux ou trois niveaux.
+3. Choisissez le chemin. Liste d'entreprises précise (moins de 500 comptes, ABM, local) : les employés de chaque page entreprise, filtrés par titre. Critères larges (secteur, effectif, zone) : recherche par profil avec le booléen et les filtres d'entreprise. Sur Sales Navigator, si le total dépasse 2 500, découpez par région, par effectif, ou par première lettre du prénom.
+4. Fixez le plafond par compte avant de lancer : 2 à 4 sur un tier A, 1 à 2 sur un B, 1 sur un C. Séniorité la plus haute d'abord, dans la limite du persona.
+5. Annoncez volume et coût, lancez sur 10 comptes ou 25 lignes, mesurez le taux de match (comptes avec au moins une personne trouvée sur comptes cherchés). Sous 50 %, revoyez les titres avec `cartographier-personas` avant de continuer.
+6. Lancez le reste. Fusionnez les runs et passez par `dedoublonner-liste` (dans la liste par `linkedin_url`, puis contre le CRM) avant toute étape payante.
+7. Enrichissez le profil seulement là où `titre`, `entreprise` ou `linkedin_url` manque : `enrichir_personne` sur ces lignes, pas sur les autres.
+8. Cherchez l'email seulement là où `email` est vide : `trouver_email` avec prénom, nom et domaine d'abord, le `linkedin_url` en second. Lisez le taux de trouvés sur les 50 premières lignes. Le téléphone (`trouver_telephone`) seulement sur les tiers A et si le canal téléphone est dans `05_Departements/Go-to-Market/contexte.md`.
+9. Rendez le CSV par persona, le taux de match, le taux d'emails trouvés, et le next step : `nettoyer-verifier`.
+
+## Exécution
+
+| Étape | Verbe | Skill d'exécution | Entrée | Sortie |
+|---|---|---|---|---|
+| 3, quel que soit l'outil branché | `trouver_personnes` | `trouver-personnes --in <csv> --dirigeants --par-entreprise 2 --format large` sans `--source` : la cascade prend le plus puissant de ce qui est branché (Prospeo, Crustdata, Ocean par domaine ; sinon Apify par Sales Navigator avec les cookies ; sinon Apify par LinkedIn ; sinon Apify par Google), l'annonce, et repasse par Google pour les entreprises restées sans personne | un CSV avec `domaine`, `linkedin_entreprise_url` ou seulement `entreprise` (le nom suffit : URL cherchée par Google, 0,0025 $), titres du persona, plafond par compte | `prenom`, `nom`, `titre`, `seniorite`, `entreprise`, `linkedin_url`, `linkedin_entreprise_url`, `ville`, `source`, `date_extraction`, et `confiance` pour les lignes Google |
+| 3, par page entreprise | `trouver_personnes` | `trouver-personnes --source employes` (`harvestapi/linkedin-company-employees`, `--dirigeants --strict-titre --par-entreprise 2`) | `linkedin_entreprise_url`, titres du persona, plafond par compte |
+| 3, sans compte ni outil API | `trouver_personnes` | `trouver-personnes --source google --in <csv de noms> --dirigeants --par-entreprise 2 --format large` (`apify/google-search-scraper` : une requête par entreprise, les lignes en confiance moyenne se vérifient) | `entreprise` (le nom), titres | mêmes colonnes plus `confiance`, `google_requete` |
+| 3, par domaine | `trouver_personnes` | `trouver-personnes --source ocean --in <csv> --dirigeants --par-entreprise 2` (Ocean) ou `--source prospeo --in <csv> --dirigeants --par-entreprise 2 --email-verifie --cacher-deja-reveles --reveler` (Prospeo : recherche puis emails vérifiés en lot, sans compte LinkedIn) | `domaine` (500 max par recherche Prospeo), titres ou séniorités du persona, plafond par compte | `prenom`, `nom`, `titre`, `seniorite`, `entreprise`, `linkedin_url`, `linkedin_entreprise_url`, `ville`, `source`, `date_extraction` |
+| 2 | `construire_requete_salesnav` | `construire-requete-salesnav` | titres du persona (`--persona atl`), `--titres-exclus`, `--region`, `--effectif`, `--seniorites`, et un filtre à cocher si le signal le demande | l'URL Sales Navigator, le résumé des filtres, une ligne dans `Ciblage/requetes-booleennes.md` (`--enregistrer`) |
+| 3, par critères | `trouver_personnes` | `trouver-personnes` (`harvestapi/linkedin-profile-search`, Unipile ou vos cookies sur l'URL Sales Navigator construite à l'étape 2, ou Crustdata) | booléen de titres, secteur, effectif, zone, ou `--url` | mêmes colonnes, plus `domaine` quand l'outil le donne |
+| 7 | `enrichir_personne` | `enrichir-personne` | `linkedin_url`, lignes où `titre` ou `entreprise` est vide | `titre`, `entreprise`, `domaine`, `ville`, `pays` complétés, plus `headline`, `resume`, `anciennete_poste`, `experiences` (et `posts_recents` avec `--posts`) |
+| 8 | `trouver_email` | `trouver-email` (FullEnrich, puis `--source prospeo` sur ce qui reste vide si Prospeo est branché) | `prenom`, `nom`, `domaine`, puis `linkedin_url` ; lignes où `email` est vide | `email`, `email_statut` |
+| 8, tiers A | `trouver_telephone` | `trouver-telephone` | `linkedin_url` ou `prenom`, `nom`, `entreprise` | `telephone` |
+
+Sortie : `trouver-personnes_<persona>-<sujet>_<date>.csv`, colonnes de `docs/conventions-gtm.md` section 8, avec `score_icp` et `tier` recopiés depuis la ligne entreprise.
+
+**Où ça s'écrit** : chaque requête booléenne validée (persona, requête Sales Navigator ou LinkedIn, filtres, URL, volume obtenu, date) dans `05_Departements/Go-to-Market/Ciblage/requetes-booleennes.md`, écrite par `construire-requete-salesnav --enregistrer`, pour être rejouée sans la reconstruire.
+
+## Repères
+
+| Repère | Valeur |
+|---|---|
+| Résultats maximum par recherche Sales Navigator | 2 500 |
+| Longueur maximum d'un booléen | environ 1 000 caractères |
+| Taux de match acceptable | au moins la moitié des comptes renvoient une personne |
+| Emails trouvés attendus | 70 % des lignes ; sous 50 % sur l'échantillon, on vérifie les noms et les domaines avant de relancer |
+| Plafond par compte | 2 à 4 (A), 1 à 2 (B), 1 (C), 5 au maximum |
+| Lignes de test | 10 comptes ou 25 lignes, puis 50 pour l'email |
+| Ordre d'entrée pour l'email | prénom + nom + domaine, puis `linkedin_url` |
+
+## Template
+
+```
+Persona : <nom> (<ATL | BTL>)
+Booléen titre : (<titre 1> OR "<titre 2>" OR <variante EN>) NOT (assistant OR stagiaire OR alternant OR "à la recherche")
+Chemin : <page entreprise | critères>
+Filtres entreprise : <secteur> / <effectif> / <zone>   (ou : <n> comptes tier A et B)
+Plafond par compte : <n>
+Test : 10 comptes -> taux de match <x %>
+Fichier : trouver-personnes_<persona>-<sujet>_<date>.csv
+```
+
+## Règles
+
+- Jamais de personnes chez des comptes `exclu = oui` ou tier C sans demande explicite.
+- Un persona par recherche et par fichier ; on ne mélange pas DG et responsable marketing dans un même CSV.
+- Le booléen exclut toujours assistant, stagiaire, alternant, étudiant et les profils en recherche.
+- Le poste actuel prime sur l'accroche du profil pour remplir `titre` ; l'accroche sert à départager un indépendant d'un dirigeant.
+- Un enrichissement ne se lance que sur une cellule vide.
+- Une entreprise locale sans page LinkedIn garde sa ligne entreprise avec le téléphone de la fiche : le canal sera l'appel.
+- Aucun email deviné à partir d'un format de domaine : une adresse non renvoyée par l'outil reste vide.
+
+## Exemples
+
+- "Trouve les DRH de ces 80 entreprises" : chemin page entreprise, booléen DRH avec variantes, plafond 2 ; réponse attendue : un CSV de 80 à 160 lignes, taux de match, taux d'emails, next step `nettoyer-verifier`.
+- "Les fondateurs de SaaS de 11 à 50 personnes en France" : `sourcer-entreprises` d'abord si aucune liste, puis recherche par critères en deux runs d'effectif ; réponse attendue : un CSV par persona, sous 2 500 par run, dédoublonné par `linkedin_url`.
+- "Ajoute les emails à ma liste de contacts" : `trouver_email` sur les lignes où `email` est vide, test sur 50 lignes ; réponse attendue : `email` et `email_statut` remplis, taux de trouvés, lignes restées vides listées.

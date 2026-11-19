@@ -1,0 +1,128 @@
+---
+name: connecter-outils
+description: >
+  Branche un par un les 7 outils de la stack (Apify, Unipile, Crustdata, FullEnrich, Ocean.io,
+  Lemlist, HubSpot) et les 4 optionnels (Prospeo pour la recherche par filtres exacts et les emails
+  vérifiés, PredictLeads et TheirStack pour les signaux, Publora pour programmer les posts LinkedIn) depuis le chat : demande la clé, la teste avec un appel gratuit, l'écrit dans
+  le .env, coche "Etat des connexions" dans OUTILS.md et fixe priorite, canal_linkedin,
+  canal_email et crm. Gère aussi les cookies LinkedIn pour les actors Sales Navigator d'Apify.
+  Se déclenche sur : "connecte mes outils", "branche Unipile", "configure mes clés API",
+  "installe ma prospection" (phase outils), "ma clé Apify a changé", "reconnecte LinkedIn",
+  "ajoute mes cookies Sales Navigator". Ne pas utiliser pour : remplir contexte.md (voir
+  `installer-gtm`) ni pour lancer une recherche (voir les skills de verbe).
+---
+
+## Outil
+
+Aucun outil n'est requis avant ce skill : c'est lui qui écrit `05_Departements/Go-to-Market/OUTILS.md`. Son script
+`scripts/verifier_connexions.py` s'appuie sur la bibliothèque commune de `10_Skills/_commun/`
+(`gtm_common.py` : racine, .env, CSV, clients Unipile, FullEnrich, Crustdata, HubSpot ;
+`apify_run.py` : lancer un actor, attendre, lire le dataset, prix vérifiés).
+
+## Entrée
+
+L'utilisateur, en conversation. Pour chaque outil, vous lui donnez le lien exact de la page où
+copier la clé, il la colle dans le chat, vous l'écrivez dans `.env` avec
+`python3 scripts/verifier_connexions.py --set CLE=VALEUR` (jamais affichée, jamais dans un skill).
+S'il n'a pas l'outil : dites-le, laissez la ligne vide, passez au suivant.
+
+## Sortie
+
+- `.env` à la racine (créé depuis `.env.example` au premier `--set`)
+- `05_Departements/Go-to-Market/OUTILS.md` : table "Etat des connexions" cochée, avec la date et le compte ou quota, et le bloc
+  `priorite:` (apify si `APIFY_TOKEN` répond, sinon api), `canal_linkedin:` (unipile ou lemlist,
+  choisi par l'utilisateur), `canal_email: lemlist`, `crm:` (hubspot si le token répond, sinon aucun)
+- un résumé de 7 lignes à l'utilisateur : connecté, absent, à refaire
+
+## Procédure
+
+Une question à la fois, dans cet ordre. Après chaque clé, testez avec un appel gratuit :
+`python3 scripts/verifier_connexions.py --outil <nom>`.
+
+1. **Apify** (`APIFY_TOKEN`) : token personnel sur https://console.apify.com/settings/integrations.
+   Test : `GET /v2/users/me`. Si présent, `priorite: apify`.
+2. **Unipile** (`UNIPILE_API_KEY`, `UNIPILE_DSN`) : compte sur https://dashboard.unipile.com, le DSN
+   est affiché sur la page d'accueil du dashboard (format `https://apiXX.unipile.com:XXXXX`), le
+   token sur https://dashboard.unipile.com/access-tokens. Puis connecter le compte LinkedIn :
+   dashboard, Accounts, Connect an account, LinkedIn, méthode Credential, code reçu par email.
+   Le test lit `/api/v1/accounts`, vérifie un compte `LINKEDIN` en statut `OK` et écrit lui-même
+   `UNIPILE_ACCOUNT_ID` et `UNIPILE_OWN_PROVIDER_ID` dans `.env`.
+3. **Crustdata** (`CRUSTDATA_API_KEY`) : https://app.crustdata.com/api-keys. Test : `/user/credits`,
+   annoncez le solde.
+4. **FullEnrich** (`FULLENRICH_API_KEY`) : https://app.fullenrich.com/app/settings/api. Test :
+   `/account/credits`, annoncez le solde (1 crédit par email, 10 par mobile).
+5. **Ocean.io** (`OCEAN_API_KEY`) : app.ocean.io, Settings, page "API tokens" (réservée aux admins),
+   bouton New token. Test : `/v2/credits/balance` (gratuit). Les lookalikes passent par l'API en CLI
+   (`trouver-lookalikes`) ; le MCP Ocean est optionnel :
+   `claude mcp add --transport http ocean_data_api "https://api.ocean.io/mcp/?api-token=<cle>"`.
+5 bis. **Prospeo** (`PROSPEO_API_KEY`, optionnel) : app.prospeo.io, Settings, API, "Create API key". Une base de
+   300 M de contacts et 90 M d'emails vérifiés, avec une recherche par filtres exacts (industries, lieux, technos,
+   ICP inverse, clients clés, lookalike par texte) et des emails et mobiles vérifiés à la révélation. Test :
+   `GET /account-information` (gratuit : crédits restants, plan). Coûts : 1 crédit par page de 25 résultats de
+   recherche, 1 crédit par email vérifié révélé, 10 par mobile, 0 sans résultat. Le MCP Prospeo
+   (`https://mcp.prospeo.io`, en-tête `X-KEY`) reste optionnel : les scripts passent par l'API.
+6. **Lemlist** (`LEMLIST_API_KEY`) : app.lemlist.com, Settings, Integrations, API, "Generate a new key".
+   Test : `GET /team`. L'envoi (`envoyer-sequence`) et la lecture des réponses (`verifier-reponses`)
+   passent par l'API en CLI. Le MCP Lemlist est optionnel, pour les stats et l'aperçu d'email :
+   `claude mcp add --transport http lemlist https://app.lemlist.com/mcp` (OAuth au premier appel).
+7. **HubSpot** (`HUBSPOT_ACCESS_TOKEN`) : Paramètres, Intégrations, Applications privées, créer une
+   app avec les scopes `crm.objects.contacts` et `crm.objects.companies` (lecture et écriture), `crm.objects.deals`
+   (lecture), notes et tâches (`crm.objects.contacts.write` les couvre selon l'interface ; sinon cocher notes et tasks), et les
+   associations. Sans les deals, `crm lire` renvoie 403.
+   Test : lecture d'un contact. Si présent, `crm: hubspot`.
+8. **PredictLeads et TheirStack (optionnels, seulement si l'utilisateur veut les événements d'entreprise,
+   l'intent ou des offres filtrées par techno)**. PredictLeads (`PREDICTLEADS_API_KEY` + `PREDICTLEADS_API_TOKEN`) :
+   les deux sont sur predictleads.com, espace client, page API ; test : `GET /api_subscription`. Abonnement mensuel
+   avec quota de requêtes, pas de crédit par résultat. TheirStack (`THEIRSTACK_API_KEY`) : app.theirstack.com,
+   Settings, API keys ; test : une recherche floutée (0 crédit). Facturation : 1 crédit par offre ou entreprise
+   renvoyée, palier gratuit à l'inscription. S'ils sont branchés, écrire `signaux_secours:` dans OUTILS.md ; sinon
+   `aucun`, et les sous-skills du master `detecter-signaux` qui en dépendent (événements, intent) restent en lecture manuelle.
+8 bis. **Publora (optionnel, pour le contenu)** (`PUBLORA_API_KEY`) : le skill `planifier-post` programme les posts
+   LinkedIn avec. Trois étapes chez l'utilisateur : créer le compte sur publora.com (palier gratuit : 15 posts par
+   mois, Pro pour l'illimité) ; connecter son profil LinkedIn dans le tableau de bord (menu Connections, bouton
+   LinkedIn, OAuth : l'API ne sait pas connecter un compte) ; menu API (ou Settings, API Keys), Generate API Key,
+   copier tout de suite (elle n'est affichée qu'une fois), la coller dans le chat. Test : `GET /platform-connections`
+   (gratuit) : la clé est valide et le script liste les comptes connectés avec leur état de jeton ; sans compte
+   LinkedIn dans la réponse, renvoyer l'utilisateur au tableau de bord. Aucun coût par appel. Le MCP Publora
+   existe aussi (docs.publora.com/guides/mcp-server) : optionnel, les scripts passent par l'API.
+9. **Cookies Sales Navigator pour Apify** (facultatif, seulement si l'utilisateur veut l'actor
+   `curious_coder/linkedin-sales-navigator-search-scraper`) : `pip3 install browser_cookie3`, puis
+   `python3 10_Skills/connecter-outils/scripts/rafraichir_cookies_linkedin.py --check`. Le script lit les
+   cookies LinkedIn de tous les profils Chrome, Arc, Brave et Edge (le trousseau du système demande une
+   autorisation la première fois : "Toujours autoriser"), retient la session Sales Navigator (cookie `li_a`)
+   et construit le user agent depuis la version réelle du navigateur. Si plusieurs comptes LinkedIn sont
+   ouverts, écrire `LINKEDIN_CHROME_ACCOUNT=<email du profil Chrome>` dans `.env`. Ensuite plus rien à
+   faire : `trouver-personnes` et `trouver-entreprises` relancent ce script avant chaque run Apify Sales
+   Navigator, et écrivent le résultat dans `.linkedin-cookies.json` à la racine (ignoré par git).
+   Sans `browser_cookie3` (Firefox, Safari, machine partagée) : exporter tous les cookies avec l'extension
+   Cookie-Editor dans un fichier hors du dépôt, écrire son chemin dans `LINKEDIN_COOKIES_FILE` et le user
+   agent exact du navigateur dans `LINKEDIN_USER_AGENT`. Un user agent qui ne correspond pas au navigateur
+   qui a émis les cookies (par exemple Chrome/145 alors que Chrome est en 153) fait renouveler la session par
+   LinkedIn : la page 1 passe, la page 2 répond "Cookies are expired". Jamais de cookie dans le chat.
+10. Demandez le canal LinkedIn voulu (Unipile avec le compte de l'utilisateur, ou Lemlist multicanal),
+   puis écrivez tout : `python3 scripts/verifier_connexions.py --ecrire-outils --canal-linkedin unipile`.
+11. Résumez l'état des 7 outils (et des 3 optionnels) et proposez un seul next step : `installer-gtm` si `05_Departements/Go-to-Market/contexte.md` a
+    encore des crochets, sinon "on construit votre première liste".
+
+## Garde-fous
+
+- Ne jamais afficher, répéter ni logger une clé. `--set` écrit sans écho ; les scripts lisent `.env`.
+- Un test échoue : corriger tout de suite avec l'utilisateur (clé recopiée sans espace, DSN avec
+  `https://`), ne pas passer à l'outil suivant tant que ce n'est pas réglé, sauf s'il veut sauter.
+- Aucun run Apify pendant la connexion : le test du token est gratuit, les cookies Sales Navigator
+  ne sont pas testés (un test serait un run payant), ils sont seulement vérifiés présents.
+- `05_Departements/Go-to-Market/OUTILS.md` et `.env` ne sont modifiés que par ce skill et `installer-gtm`.
+- Compte LinkedIn récent ou déjà restreint : proposez d'écrire `LIMITE_INVITATIONS_JOUR=15` dans
+  `.env`, `envoyer-sequence` la lit (plafond dur 30).
+
+## Erreurs fréquentes
+
+| Symptôme | Cause | Fix |
+|---|---|---|
+| Unipile : compte en statut `CREDENTIALS` | LinkedIn a demandé une revalidation | refaire la connexion du compte dans le dashboard, relancer le test |
+| Unipile : 401 | DSN sans `https://` ou token d'un autre workspace | corriger `UNIPILE_DSN`, régénérer le token |
+| Apify : HTTP 401 | token incomplet | recopier depuis la page Integrations |
+| FullEnrich ou Crustdata : 402 | solde à zéro | recharger, l'outil reste coché mais le solde est noté dans OUTILS.md |
+| Lemlist MCP "Needs authentication" | OAuth pas terminé | lancer un outil Lemlist de lecture (`get_team_info`), valider dans le navigateur |
+| HubSpot : 403 | scopes manquants sur l'app privée | ajouter les scopes contacts et companies, régénérer le token |
+| `OUTILS.md introuvable` | script lancé hors du module GTM | lancer depuis `10_Skills/connecter-outils/scripts/` du module GTM |

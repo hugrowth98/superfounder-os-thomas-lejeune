@@ -1,0 +1,110 @@
+#!/usr/bin/env python3
+"""Vérifie l'intégrité des skills du dépôt.
+
+- chaque SKILL.md a un frontmatter YAML avec `name` et `description`
+- `name` correspond au nom du dossier
+- aucun tiret cadratin (U+2014) ni demi-cadratin (U+2013) dans les .md du dépôt
+- aucune clé API en clair dans les fichiers versionnés
+- aucun placeholder {{TOKEN}} résiduel (les skills lisent le contexte à l'exécution)
+
+Usage : python3 scripts/validate_skills.py
+"""
+import re
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+DASHES = ("—", "–")
+SECRET_RE = re.compile(r"(?i)(api[_-]?key|token|secret)\s*[=:]\s*['\"]?[A-Za-z0-9_\-]{24,}")
+PLACEHOLDER_RE = re.compile(r"\{\{[A-Z_\[\]0-9]+\}\}")
+# fichiers où {{...}} est légitime (gabarits de notes)
+PLACEHOLDER_OK = {"daily-note.md"}
+# le seul fichier où le tiret cadratin apparaît légitimement : comme exemple de ce qu'il faut bannir
+DASH_OK = {"anti-ai-voice.md"}
+TEXT_SUFFIXES = {".md", ".py", ".json", ".example", ".sh", ".yml", ".yaml"}
+
+
+def parse_frontmatter(text):
+    if not text.startswith("---"):
+        return None
+    end = text.find("\n---", 3)
+    if end == -1:
+        return None
+    block = text[3:end]
+    data = {}
+    current = None
+    for line in block.splitlines():
+        m = re.match(r"^([A-Za-z_-]+):\s*(.*)$", line)
+        if m:
+            current = m.group(1)
+            data[current] = m.group(2).strip()
+        elif current and line.startswith(" "):
+            data[current] = (data[current] + " " + line.strip()).strip()
+    return data
+
+
+def iter_files(suffixes):
+    for path in ROOT.rglob("*"):
+        if path.is_dir() or ".git" in path.parts or ".agents" in path.parts or ".claude" in path.parts:
+            continue
+        if path.suffix in suffixes or path.name in {".env.example"}:
+            yield path
+
+
+def main():
+    errors = []
+    # les archives (11_Archives/) sont figees : elles ne sont ni validees ni comptees
+    skills = sorted(p for p in ROOT.rglob("SKILL.md") if ".git" not in p.parts and ".agents" not in p.parts and ".claude" not in p.parts
+                    and "11_Archives" not in p.parts)
+    premier_niveau = [p for p in skills if p.parent.parent == ROOT / "10_Skills"]
+    sous_skills = [p for p in skills if "sous-skills" in p.parts]
+    masters = sorted({p.parts[p.parts.index("sous-skills") - 1] for p in sous_skills})
+    for path in skills:
+        text = path.read_text(encoding="utf-8")
+        fm = parse_frontmatter(text)
+        rel = path.relative_to(ROOT)
+        if fm is None:
+            errors.append(f"{rel}: frontmatter absent ou mal fermé")
+            continue
+        name = fm.get("name", "").strip()
+        desc = fm.get("description", "").strip().lstrip(">").strip()
+        if not name:
+            errors.append(f"{rel}: champ `name` manquant")
+        elif name != path.parent.name:
+            errors.append(f"{rel}: `name` ({name}) ne correspond pas au dossier ({path.parent.name})")
+        if not desc:
+            errors.append(f"{rel}: champ `description` manquant")
+
+    for path in iter_files({".md"}):
+        if path.name in DASH_OK:
+            continue
+        text = path.read_text(encoding="utf-8")
+        for dash in DASHES:
+            if dash in text:
+                line = next(i for i, l in enumerate(text.splitlines(), 1) if dash in l)
+                errors.append(f"{path.relative_to(ROOT)}:{line}: tiret cadratin ou demi-cadratin interdit")
+                break
+
+    for path in iter_files(TEXT_SUFFIXES):
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        if SECRET_RE.search(text):
+            errors.append(f"{path.relative_to(ROOT)}: chaîne ressemblant à une clé API")
+        if path.suffix == ".md" and path.name not in PLACEHOLDER_OK and PLACEHOLDER_RE.search(text):
+            errors.append(f"{path.relative_to(ROOT)}: placeholder {{{{...}}}} résiduel")
+
+    for cm in ROOT.rglob("CLAUDE.md"):
+        if ".git" in cm.parts or ".agents" in cm.parts or ".claude" in cm.parts:
+            continue
+        n = len(cm.read_text(encoding="utf-8").splitlines())
+        if n > 200:
+            errors.append(f"{cm.relative_to(ROOT)}: {n} lignes, au-dessus des 200 recommandées")
+
+    print(f"{len(skills)} SKILL.md vérifiés : {len(premier_niveau)} skills de premier niveau (dont {len(masters)} masters : {', '.join(masters)}) et {len(sous_skills)} sous-skills")
+    if errors:
+        print("\n".join(errors))
+        sys.exit(1)
+    print("OK : frontmatter valide, aucun tiret cadratin, aucune clé, aucun placeholder, CLAUDE.md sous 200 lignes")
+
+
+if __name__ == "__main__":
+    main()
